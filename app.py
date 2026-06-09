@@ -431,7 +431,7 @@ def render_analysis_result(analysis_result, current_threshold, current_signature
 
     stored_signature = analysis_result.get("input_signature")
     if stored_signature is not None and current_signature is not None and stored_signature != current_signature:
-        st.warning("Data input sudah berubah setelah analisis terakhir. Klik Analisis dari Data Hasil OCR untuk memperbarui hasil.")
+        st.warning("Data input sudah berubah setelah analisis terakhir. Klik tombol analisis lagi untuk memperbarui hasil.")
 
     if analysis_result.get("status") == "insufficient":
         st.warning(analysis_result.get("message", "Data belum cukup untuk dianalisis."))
@@ -459,12 +459,17 @@ def render_analysis_result(analysis_result, current_threshold, current_signature
     render_health_metrics(nutrition_data, takaran_saji, current_threshold)
 
 
-def run_product_analysis(product_name, takaran_saji, nutrition_data, komposisi, current_threshold, store_key=None, input_signature=None):
+def store_product_analysis_result(product_name, takaran_saji, nutrition_data, komposisi, store_key, input_signature=None):
+    """Menganalisis produk lalu menyimpan hasil tanpa langsung merender output.
+
+    Streamlit selalu melakukan rerun setelah tombol diklik. Jika hasil langsung dirender
+    di bawah tombol dan juga dirender di panel hasil, tampilan menjadi dobel. Fungsi ini
+    menjaga satu sumber tampilan hasil, yaitu panel Hasil Analisis AI di samping form.
+    """
     analysis_result = build_analysis_result(product_name, takaran_saji, nutrition_data, komposisi)
     analysis_result["input_signature"] = input_signature or make_analysis_signature(product_name, takaran_saji, nutrition_data, komposisi)
 
-    if store_key:
-        st.session_state[store_key] = analysis_result
+    st.session_state[store_key] = analysis_result
 
     if analysis_result.get("status") == "ok":
         risk_score = analysis_result["risk_score"]
@@ -477,6 +482,23 @@ def run_product_analysis(product_name, takaran_saji, nutrition_data, komposisi, 
             "nutrition": nutrition_data,
         })
 
+    return analysis_result
+
+
+def run_product_analysis(product_name, takaran_saji, nutrition_data, komposisi, current_threshold, store_key=None, input_signature=None):
+    """Fungsi lama tetap disediakan untuk kompatibilitas internal.
+
+    Untuk fitur utama, gunakan store_product_analysis_result agar hasil tidak tampil dobel.
+    """
+    target_key = store_key or "manual_analysis_result"
+    analysis_result = store_product_analysis_result(
+        product_name,
+        takaran_saji,
+        nutrition_data,
+        komposisi,
+        target_key,
+        input_signature=input_signature,
+    )
     render_analysis_result(analysis_result, current_threshold, current_signature=analysis_result["input_signature"])
     return analysis_result
 
@@ -609,24 +631,30 @@ else:
 
 if app_mode == "Analisis Produk Tunggal":
     st.header("Analisis Produk Tunggal")
-    preset_name = st.selectbox("Pilih contoh uji atau isi manual", list(EXAMPLE_PRESETS.keys()), index=1)
-    defaults = dict(EXAMPLE_PRESETS[preset_name])
 
-    product_name, takaran_saji, nutrition_data, komposisi = input_form("manual", defaults)
+    manual_input_col, manual_result_col = st.columns([1.15, 1], gap="large")
 
-    manual_signature = make_analysis_signature(product_name, takaran_saji, nutrition_data, komposisi)
-    if st.button("Analisis AI dan Gizi", type="primary"):
-        run_product_analysis(
-            product_name,
-            takaran_saji,
-            nutrition_data,
-            komposisi,
-            current_threshold,
-            store_key="manual_analysis_result",
-            input_signature=manual_signature,
-        )
-    elif st.session_state.manual_analysis_result:
-        st.markdown("### Hasil Analisis Terakhir")
+    with manual_input_col:
+        st.subheader("Input Informasi Produk")
+        preset_name = st.selectbox("Pilih contoh uji atau isi manual", list(EXAMPLE_PRESETS.keys()), index=1)
+        defaults = dict(EXAMPLE_PRESETS[preset_name])
+
+        product_name, takaran_saji, nutrition_data, komposisi = input_form("manual", defaults)
+        manual_signature = make_analysis_signature(product_name, takaran_saji, nutrition_data, komposisi)
+
+        if st.button("Analisis AI dan Gizi", type="primary"):
+            store_product_analysis_result(
+                product_name,
+                takaran_saji,
+                nutrition_data,
+                komposisi,
+                store_key="manual_analysis_result",
+                input_signature=manual_signature,
+            )
+            st.success("Analisis berhasil diperbarui. Hasil ditampilkan di panel kanan.")
+
+    with manual_result_col:
+        st.subheader("Hasil Analisis AI (Prediksi Risiko)")
         render_analysis_result(st.session_state.manual_analysis_result, current_threshold, current_signature=manual_signature)
 
 
@@ -731,15 +759,15 @@ elif app_mode == "Scan from Image":
         ocr_signature = make_analysis_signature(product_name, takaran_saji, nutrition_data, komposisi)
 
         if st.button("Analisis dari Data Hasil OCR", type="primary"):
-            run_product_analysis(
+            store_product_analysis_result(
                 product_name,
                 takaran_saji,
                 nutrition_data,
                 komposisi,
-                current_threshold,
                 store_key="ocr_analysis_result",
                 input_signature=ocr_signature,
             )
+            st.success("Analisis berhasil diperbarui. Hasil ditampilkan di panel kanan.")
 
     with result_col:
         st.subheader("Hasil Analisis AI (Prediksi Risiko)")
