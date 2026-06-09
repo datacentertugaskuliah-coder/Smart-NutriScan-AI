@@ -44,6 +44,13 @@ feat_model, lgbm_model, w2v_model, scaler = load_all_models_and_scaler()
 reader = load_ocr_model()
 
 
+def safe_image(image, caption=None):
+    try:
+        st.image(image, caption=caption, use_container_width=True)
+    except TypeError:
+        st.image(image, caption=caption, use_column_width=True)
+
+
 NUTRITION_KEYS = [
     "energi",
     "lemak_total",
@@ -361,7 +368,7 @@ elif app_mode == "Scan from Image":
 
         if img_file_1 is not None:
             image_1 = Image.open(img_file_1)
-            st.image(image_1, caption="Gambar nilai gizi", use_container_width=True)
+            safe_image(image_1, caption="Gambar nilai gizi")
 
             with st.spinner("Membaca nilai gizi dengan OCR multi preprocessing..."):
                 scan_result_1 = parse_scan_result(reader, image_1, mode="nutrition")
@@ -377,7 +384,7 @@ elif app_mode == "Scan from Image":
                 st.text(scan_result_1["raw_text"] or "Tidak ada teks terbaca")
             with st.expander("Lihat variasi preprocessing"):
                 for name, img in scan_result_1["variants"].items():
-                    st.image(img, caption=name, use_container_width=True)
+                    safe_image(img, caption=name)
 
     with col_scan2:
         st.subheader("Scan 2: Komposisi Produk")
@@ -386,7 +393,7 @@ elif app_mode == "Scan from Image":
 
         if img_file_2 is not None:
             image_2 = Image.open(img_file_2)
-            st.image(image_2, caption="Gambar komposisi", use_container_width=True)
+            safe_image(image_2, caption="Gambar komposisi")
 
             with st.spinner("Membaca komposisi dengan OCR multi preprocessing..."):
                 scan_result_2 = parse_scan_result(reader, image_2, mode="composition")
@@ -399,7 +406,7 @@ elif app_mode == "Scan from Image":
                 st.text(scan_result_2["raw_text"] or "Tidak ada teks terbaca")
             with st.expander("Lihat variasi preprocessing"):
                 for name, img in scan_result_2["variants"].items():
-                    st.image(img, caption=name, use_container_width=True)
+                    safe_image(img, caption=name)
 
     st.markdown("---")
     st.subheader("Konfirmasi Data Hasil OCR")
