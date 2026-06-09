@@ -1,0 +1,24 @@
+streamlit==1.32.2
+pandas==2.2.2
+numpy==1.26.4
+Pillow==10.4.0
+scikit-learn==1.4.2
+tensorflow==2.16.1
+gensim==4.3.2
+<<<<<<< HEAD
+scipy==1.11.4
+opencv-python-headless==4.9.0.80
+easyocr==1.7.1
+torch==2.2.2
+torchvision==0.17.2
+joblib==1.4.2
+shap==0.44.1
+=======
+opencv-python-headless==4.9.0.80
+easyocr==1.7.1
+joblib==1.4.2
+scipy==1.11.4
+>>>>>>> d207aa697bc12680975256e817b55a5831a88825
+openpyxl==3.1.5
+lightgbm==4.3.0
+plotly==5.22.0
