@@ -42,7 +42,14 @@ def load_ocr_model():
 
 
 feat_model, lgbm_model, w2v_model, scaler = load_all_models_and_scaler()
-reader = load_ocr_model()
+
+# EasyOCR tidak dimuat saat aplikasi pertama dibuka.
+# Model OCR baru dimuat ketika tombol proses OCR ditekan agar upload gambar tidak langsung membuat app crash.
+def get_ocr_reader_safely():
+    try:
+        return load_ocr_model(), None
+    except Exception as exc:
+        return None, str(exc)
 
 
 def safe_image(image, caption=None):
@@ -82,15 +89,35 @@ OCR_WIDGET_KEY_MAP = {
 }
 
 
+LEGACY_OCR_WIDGET_KEYS = set(OCR_WIDGET_KEY_MAP.values())
+
+# Membersihkan key lama dari versi sebelumnya.
+# Ini mencegah warning Streamlit: widget dibuat dengan default value, tetapi juga diisi lewat Session State.
+for _legacy_key in list(LEGACY_OCR_WIDGET_KEYS):
+    if _legacy_key in st.session_state:
+        del st.session_state[_legacy_key]
+
+
+def set_widget_default(key, value):
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
 def sync_ocr_value_to_form(key, value):
-    """Menyinkronkan hasil OCR ke data dict dan widget form konfirmasi."""
+    """Menyinkronkan hasil OCR hanya ke data sumber.
+
+    Catatan teknis: jangan menulis langsung ke key widget number_input atau text_area
+    setelah widget pernah dibuat, karena Streamlit dapat memunculkan error runtime.
+    Form dibuat ulang memakai versi key yang berubah setelah OCR berhasil.
+    """
     if key not in st.session_state.ocr_data:
         return
 
     st.session_state.ocr_data[key] = value
-    widget_key = OCR_WIDGET_KEY_MAP.get(key)
-    if widget_key:
-        st.session_state[widget_key] = value
+
+
+def bump_ocr_form_version():
+    st.session_state.ocr_form_version += 1
 
 
 def render_ocr_result_debug(scan_result, label):
@@ -114,9 +141,9 @@ def render_ocr_result_debug(scan_result, label):
         st.caption(f"Variasi gambar terbaik: {scan_result.get('best_variant', 'tidak diketahui')}")
         st.text(scan_result.get("raw_text") or "Tidak ada teks terbaca")
 
-    with st.expander(f"Lihat variasi preprocessing {label}", expanded=False):
-        for name, img in scan_result.get("variants", {}).items():
-            safe_image(img, caption=name)
+    with st.expander(f"Ringkasan variasi preprocessing {label}", expanded=False):
+        names = list(scan_result.get("variants", {}).keys())
+        st.write(names if names else "Tidak ada variasi gambar tersimpan.")
 
 
 NUTRITION_KEYS = [
@@ -198,6 +225,9 @@ def init_parsed_data():
 
 if "ocr_data" not in st.session_state:
     st.session_state.ocr_data = init_parsed_data()
+
+if "ocr_form_version" not in st.session_state:
+    st.session_state.ocr_form_version = 0
 
 
 def hitung_tdee_dinamis(gender, usia, berat, tinggi, aktivitas):
@@ -374,25 +404,57 @@ def run_product_analysis(product_name, takaran_saji, nutrition_data, komposisi, 
 
 
 def input_form(prefix, defaults):
-    product_name = st.text_input("Nama Produk", value=defaults.get("product_name", ""), key=f"{prefix}_name")
+    """Form input yang aman terhadap Session State Streamlit.
+
+    Prinsipnya: nilai default dimasukkan ke session_state sebelum widget dibuat,
+    lalu widget tidak lagi diberi parameter value. Cara ini menghapus warning
+    default value versus Session State API.
+    """
+    name_key = f"{prefix}_name"
+    saji_key = f"{prefix}_saji"
+    energi_key = f"{prefix}_energi"
+    lemak_key = f"{prefix}_lemak"
+    jenuh_key = f"{prefix}_jenuh"
+    protein_key = f"{prefix}_protein"
+    karbo_key = f"{prefix}_karbo"
+    gula_key = f"{prefix}_gula"
+    garam_key = f"{prefix}_garam"
+    natrium_key = f"{prefix}_natrium"
+    benzoat_key = f"{prefix}_benzoat"
+    komposisi_key = f"{prefix}_komposisi"
+
+    set_widget_default(name_key, str(defaults.get("product_name", "")))
+    set_widget_default(saji_key, float(defaults.get("takaran_saji", 100.0)))
+    set_widget_default(energi_key, float(defaults.get("energi", 0.0)))
+    set_widget_default(lemak_key, float(defaults.get("lemak_total", 0.0)))
+    set_widget_default(jenuh_key, float(defaults.get("lemak_jenuh", 0.0)))
+    set_widget_default(protein_key, float(defaults.get("protein", 0.0)))
+    set_widget_default(karbo_key, float(defaults.get("karbohidrat", 0.0)))
+    set_widget_default(gula_key, float(defaults.get("gula", 0.0)))
+    set_widget_default(garam_key, float(defaults.get("garam", 0.0)))
+    set_widget_default(natrium_key, float(defaults.get("natrium", 0.0)))
+    set_widget_default(benzoat_key, float(defaults.get("natrium_benzoat", 0.0)))
+    set_widget_default(komposisi_key, str(defaults.get("komposisi", "")))
+
+    product_name = st.text_input("Nama Produk", key=name_key)
 
     c0, c1, c2 = st.columns(3)
-    takaran_saji = c0.number_input("Takaran Saji g atau ml", min_value=1.0, value=float(defaults.get("takaran_saji", 100.0)), format="%.2f", key=f"{prefix}_saji")
-    energi = c1.number_input("Energi kkal", min_value=0.0, value=float(defaults.get("energi", 0)), format="%.2f", key=f"{prefix}_energi")
-    lemak_total = c2.number_input("Lemak Total g", min_value=0.0, value=float(defaults.get("lemak_total", 0)), format="%.2f", key=f"{prefix}_lemak")
+    takaran_saji = c0.number_input("Takaran Saji g atau ml", min_value=1.0, format="%.2f", key=saji_key)
+    energi = c1.number_input("Energi kkal", min_value=0.0, format="%.2f", key=energi_key)
+    lemak_total = c2.number_input("Lemak Total g", min_value=0.0, format="%.2f", key=lemak_key)
 
     c3, c4, c5 = st.columns(3)
-    lemak_jenuh = c3.number_input("Lemak Jenuh g", min_value=0.0, value=float(defaults.get("lemak_jenuh", 0)), format="%.2f", key=f"{prefix}_jenuh")
-    protein = c4.number_input("Protein g", min_value=0.0, value=float(defaults.get("protein", 0)), format="%.2f", key=f"{prefix}_protein")
-    karbohidrat = c5.number_input("Karbohidrat g", min_value=0.0, value=float(defaults.get("karbohidrat", 0)), format="%.2f", key=f"{prefix}_karbo")
+    lemak_jenuh = c3.number_input("Lemak Jenuh g", min_value=0.0, format="%.2f", key=jenuh_key)
+    protein = c4.number_input("Protein g", min_value=0.0, format="%.2f", key=protein_key)
+    karbohidrat = c5.number_input("Karbohidrat g", min_value=0.0, format="%.2f", key=karbo_key)
 
     c6, c7, c8, c9 = st.columns(4)
-    gula = c6.number_input("Gula g", min_value=0.0, value=float(defaults.get("gula", 0)), format="%.2f", key=f"{prefix}_gula")
-    garam = c7.number_input("Garam g", min_value=0.0, value=float(defaults.get("garam", 0)), format="%.2f", key=f"{prefix}_garam")
-    natrium = c8.number_input("Natrium mg", min_value=0.0, value=float(defaults.get("natrium", 0)), format="%.2f", key=f"{prefix}_natrium")
-    natrium_benzoat = c9.number_input("Natrium Benzoat mg", min_value=0.0, value=float(defaults.get("natrium_benzoat", 0)), format="%.2f", key=f"{prefix}_benzoat")
+    gula = c6.number_input("Gula g", min_value=0.0, format="%.2f", key=gula_key)
+    garam = c7.number_input("Garam g", min_value=0.0, format="%.2f", key=garam_key)
+    natrium = c8.number_input("Natrium mg", min_value=0.0, format="%.2f", key=natrium_key)
+    natrium_benzoat = c9.number_input("Natrium Benzoat mg", min_value=0.0, format="%.2f", key=benzoat_key)
 
-    komposisi = st.text_area("Komposisi", value=defaults.get("komposisi", ""), height=120, key=f"{prefix}_komposisi")
+    komposisi = st.text_area("Komposisi", height=120, key=komposisi_key)
 
     nutrition_data = build_nutrition_data(
         energi,
@@ -407,6 +469,7 @@ def input_form(prefix, defaults):
     )
 
     return product_name, takaran_saji, nutrition_data, komposisi
+
 
 
 with st.sidebar:
@@ -484,6 +547,7 @@ elif app_mode == "Scan from Image":
 
     if st.button("Reset Hasil OCR"):
         st.session_state.ocr_data = init_parsed_data()
+        bump_ocr_form_version()
         st.success("Hasil OCR sudah dikosongkan.")
 
     col_scan1, col_scan2 = st.columns(2)
@@ -499,8 +563,12 @@ elif app_mode == "Scan from Image":
                 safe_image(image_1, caption="Gambar nilai gizi")
 
                 if st.button("Proses OCR Nilai Gizi", key="btn_ocr_gizi"):
-                    with st.spinner("Membaca nilai gizi dengan OCR yang lebih aman untuk Streamlit Cloud..."):
-                        scan_result_1, ocr_error_1 = run_ocr_safely(reader, image_1, mode="nutrition")
+                    with st.spinner("Mempersiapkan OCR dan membaca nilai gizi secara bertahap..."):
+                        reader, reader_error = get_ocr_reader_safely()
+                        if reader_error:
+                            scan_result_1, ocr_error_1 = None, reader_error
+                        else:
+                            scan_result_1, ocr_error_1 = run_ocr_safely(reader, image_1, mode="nutrition")
 
                     if ocr_error_1:
                         st.error("OCR nilai gizi gagal diproses. Aplikasi tidak dihentikan. Silakan input manual atau coba foto yang lebih jelas.")
@@ -508,12 +576,16 @@ elif app_mode == "Scan from Image":
                             st.code(ocr_error_1)
                     else:
                         parsed_gizi = scan_result_1["parsed"]
+                        changed = False
                         for key, value in parsed_gizi.items():
                             if key in st.session_state.ocr_data:
                                 if value not in [0, 0.0, "Tidak terdeteksi.", "Produk Tanpa Nama", ""]:
                                     sync_ocr_value_to_form(key, value)
+                                    changed = True
+                        if changed:
+                            bump_ocr_form_version()
 
-                        st.success("Nilai gizi berhasil diproses. Hanya angka yang lolos guard logis yang dimasukkan ke form. Periksa lagi sebelum analisis.")
+                        st.success("Nilai gizi berhasil diproses. Angka satuan g yang terbaca sebagai 9 sudah dikoreksi sebelum masuk form. Periksa lagi sebelum analisis.")
                         render_ocr_result_debug(scan_result_1, "nilai gizi")
             except Exception as exc:
                 st.error("Gambar nilai gizi tidak bisa dibaca. Coba upload ulang dalam format JPG atau PNG.")
@@ -531,8 +603,12 @@ elif app_mode == "Scan from Image":
                 safe_image(image_2, caption="Gambar komposisi")
 
                 if st.button("Proses OCR Komposisi", key="btn_ocr_komposisi"):
-                    with st.spinner("Membaca komposisi dengan OCR yang lebih aman untuk Streamlit Cloud..."):
-                        scan_result_2, ocr_error_2 = run_ocr_safely(reader, image_2, mode="composition")
+                    with st.spinner("Mempersiapkan OCR dan membaca komposisi secara bertahap..."):
+                        reader, reader_error = get_ocr_reader_safely()
+                        if reader_error:
+                            scan_result_2, ocr_error_2 = None, reader_error
+                        else:
+                            scan_result_2, ocr_error_2 = run_ocr_safely(reader, image_2, mode="composition")
 
                     if ocr_error_2:
                         st.error("OCR komposisi gagal diproses. Aplikasi tidak dihentikan. Silakan input manual atau coba foto yang lebih jelas.")
@@ -542,6 +618,7 @@ elif app_mode == "Scan from Image":
                         parsed_komposisi = scan_result_2["parsed"].get("komposisi", "Tidak terdeteksi.")
                         if parsed_komposisi != "Tidak terdeteksi.":
                             sync_ocr_value_to_form("komposisi", parsed_komposisi)
+                            bump_ocr_form_version()
 
                         st.success("Komposisi berhasil diproses dari satu variasi OCR terbaik agar tidak berulang. Periksa lagi sebelum analisis.")
                         render_ocr_result_debug(scan_result_2, "komposisi")
@@ -554,7 +631,8 @@ elif app_mode == "Scan from Image":
     st.subheader("Konfirmasi Data Hasil OCR")
     st.warning("Jangan langsung percaya OCR mentah. Koreksi angka dan komposisi sebelum menjalankan rekomendasi.")
 
-    product_name, takaran_saji, nutrition_data, komposisi = input_form("ocr", st.session_state.ocr_data)
+    ocr_prefix = f"ocr_{st.session_state.ocr_form_version}"
+    product_name, takaran_saji, nutrition_data, komposisi = input_form(ocr_prefix, st.session_state.ocr_data)
 
     if st.button("Analisis dari Data Hasil OCR", type="primary"):
         run_product_analysis(product_name, takaran_saji, nutrition_data, komposisi, current_threshold)

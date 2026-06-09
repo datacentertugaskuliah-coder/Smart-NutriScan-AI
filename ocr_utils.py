@@ -1,7 +1,7 @@
 """
 Utility OCR untuk Smart NutriScan AI.
 
-Revisi v5 fokus pada akurasi logis hasil OCR.
+Revisi v7 fokus pada akurasi logis hasil OCR dan koreksi salah baca satuan gram.
 Masalah yang diperbaiki:
 1. Hasil dari beberapa variasi preprocessing tidak lagi digabung mentah karena bisa menduplikasi teks.
 2. Parsing nilai gizi memakai kandidat per variasi gambar, lalu memilih nilai yang paling masuk akal.
@@ -9,6 +9,7 @@ Masalah yang diperbaiki:
 4. Nilai tidak wajar seperti 259 g untuk lemak jenuh diperbaiki dengan aturan desimal yang ketat.
 5. Takaran saji ikut dibaca dari label.
 6. Komposisi dibaca dari satu variasi terbaik agar tidak berulang dua sampai tiga kali.
+7. Huruf g yang sering terbaca sebagai angka 9 diperbaiki sebelum angka masuk ke form.
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ NUTRITION_FIELD_LIMITS: Dict[str, Tuple[float, float]] = {
 }
 
 
-def normalize_pil_image(pil_image: Image.Image, max_side: int = 1700) -> Image.Image:
+def normalize_pil_image(pil_image: Image.Image, max_side: int = 1100) -> Image.Image:
     """Membuat gambar aman untuk OCR dan menjaga orientasi EXIF."""
     image = ImageOps.exif_transpose(pil_image).convert("RGB")
     width, height = image.size
@@ -71,8 +72,8 @@ def preprocess_image_variants_for_ocr(pil_image: Image.Image) -> Dict[str, Image
     img = np.array(safe_image)
 
     h, w = img.shape[:2]
-    if max(h, w) < 1300:
-        img = cv2.resize(img, None, fx=1.6, fy=1.6, interpolation=cv2.INTER_CUBIC)
+    if max(h, w) < 900:
+        img = cv2.resize(img, None, fx=1.25, fy=1.25, interpolation=cv2.INTER_CUBIC)
 
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
@@ -238,6 +239,114 @@ def normalize_ocr_text(text: str) -> str:
     return text
 
 
+
+GRAM_BASED_FIELDS = {
+    "lemak_total",
+    "lemak_jenuh",
+    "protein",
+    "karbohidrat",
+    "gula",
+    "garam",
+}
+
+
+def repair_gram_unit_read_as_nine(line: str, field: str) -> str:
+    """Memperbaiki pola OCR saat huruf g terbaca sebagai angka 9.
+
+    Contoh nyata pada label kecil:
+    5g  -> 59
+    2.5g -> 2.59 atau 259
+    14g -> 149
+    1g  -> 19
+    0g  -> 09 atau 9, terutama bila baris juga memuat 0 persen AKG.
+
+    Aturan ini hanya diterapkan pada field berbasis gram. Energi dan natrium tidak disentuh.
+    """
+    clean = normalize_ocr_text(line)
+    if field not in GRAM_BASED_FIELDS:
+        return clean
+
+    if " g" in clean or re.search(r"\d+\s*g\b", clean):
+        return clean
+
+    field_markers = {
+        "lemak_total": ("lemak total",),
+        "lemak_jenuh": ("lemak jenuh",),
+        "protein": ("protein",),
+        "karbohidrat": ("karbohidrat total", "karbohidrat"),
+        "gula": ("gula",),
+        "garam": ("garam",),
+    }
+
+    if not any(marker in clean for marker in field_markers.get(field, ())):
+        return clean
+
+    def fix_number_token(match: re.Match) -> str:
+        token = match.group(1)
+        after = match.group(2) or ""
+
+        # Jangan ubah angka yang memang persen.
+        if after.strip().startswith("%"):
+            return match.group(0)
+
+        # 2.59 pada label gizi umumnya berasal dari 2.5g.
+        if re.fullmatch(r"\d+\.\d+9", token):
+            return token[:-1] + " g" + after
+
+        # 09 dan 0 9 berasal dari 0g.
+        if token in {"09", "0 9", "0.9"}:
+            return "0 g" + after
+
+        # 59 -> 5g, 149 -> 14g, 19 -> 1g.
+        if token.isdigit() and len(token) >= 2 and token.endswith("9"):
+            return token[:-1] + " g" + after
+
+        # Khusus baris protein 0g yang sering terbaca sebagai 9 dan disertai 0 persen.
+        if field == "protein" and token == "9" and re.search(r"\b0\s*%", clean):
+            return "0 g" + after
+
+        return match.group(0)
+
+    # Ambil angka setelah marker field agar angka pada teks lain tidak berubah.
+    earliest_marker_pos = None
+    markers = field_markers.get(field, ())
+    for marker in markers:
+        idx = clean.find(marker)
+        if idx >= 0:
+            end = idx + len(marker)
+            if earliest_marker_pos is None or end < earliest_marker_pos:
+                earliest_marker_pos = end
+
+    if earliest_marker_pos is None:
+        return clean
+
+    before = clean[:earliest_marker_pos]
+    after = clean[earliest_marker_pos:]
+    after = re.sub(r"\b(\d+(?:\.\d+)?|0\s+9)(\s*(?:%|$|\d+\s*%))", fix_number_token, after)
+    after = re.sub(r"\s+", " ", after)
+    return (before + after).strip()
+
+
+def _is_suspicious_gram_value(field: str, value: float, line: str) -> bool:
+    """Menandai nilai gram yang kemungkinan besar masih berasal dari salah baca satuan g sebagai 9."""
+    clean = normalize_ocr_text(line)
+    if field not in GRAM_BASED_FIELDS:
+        return False
+    if re.search(r"\d+\s*g\b", clean):
+        return False
+
+    # Nilai gram yang berakhiran .9 setelah repair lama hampir selalu salah baca unit.
+    if abs(value - round(value)) > 0:
+        frac_digit = int(round((value - int(value)) * 10))
+        if frac_digit == 9:
+            return True
+
+    # Pada label makanan ringan, protein 9 g tanpa satuan jelas dan persen 0 biasanya berasal dari 0g.
+    if field == "protein" and value == 9 and re.search(r"\b0\s*%", clean):
+        return True
+
+    return False
+
 def _variant_score(lines: List[str], items: List[Dict[str, Any]], mode: str) -> float:
     raw = " ".join(lines)
     clean = normalize_ocr_text(raw)
@@ -270,7 +379,7 @@ def run_ocr_multi_variant(
     reader: Any,
     pil_image: Image.Image,
     min_confidence: float = 0.16,
-    max_variants: int = 4,
+    max_variants: int = 2,
     mode: str = "nutrition",
 ) -> Dict[str, Any]:
     """Menjalankan EasyOCR per variasi dan memilih variasi terbaik sebagai raw OCR utama."""
@@ -439,6 +548,17 @@ def _repair_value_by_field(field: str, value: float, line: str) -> Optional[floa
         elif value > 20:
             value = value / 10.0
 
+    # Lapisan terakhir: bila g masih tersisa sebagai angka 9, koreksi sebelum masuk form.
+    if field in GRAM_BASED_FIELDS and _is_suspicious_gram_value(field, value, clean):
+        if field == "protein" and value == 9 and re.search(r"\b0\s*%", clean):
+            value = 0.0
+        elif value >= 10 and abs(value - round(value)) < 1e-9:
+            token = str(int(round(value)))
+            if token.endswith("9") and len(token) >= 2:
+                value = float(token[:-1])
+        elif abs(value - round(value, 1)) < 1e-9 and str(round(value, 1)).endswith(".9"):
+            value = float(str(round(value, 1))[:-2])
+
     low, high = NUTRITION_FIELD_LIMITS.get(field, (0.0, float("inf")))
     if value < low or value > high:
         return None
@@ -448,6 +568,8 @@ def _repair_value_by_field(field: str, value: float, line: str) -> Optional[floa
 
 def _candidate_from_line(field: str, line: str) -> Optional[float]:
     clean = normalize_ocr_text(line)
+    if field in GRAM_BASED_FIELDS:
+        clean = repair_gram_unit_read_as_nine(clean, field)
 
     if field == "takaran_saji":
         if "takaran saji" not in clean:
