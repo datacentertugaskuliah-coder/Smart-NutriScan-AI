@@ -4,7 +4,6 @@ import io
 from datetime import datetime
 
 import easyocr
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -12,7 +11,9 @@ from PIL import Image
 
 from model_utils import (
     analyze_product_fully,
+    classify_risk,
     detect_harmful_additives,
+    has_sufficient_input,
     load_prediction_models,
     preprocess_batch_excel_data,
 )
@@ -51,6 +52,13 @@ def safe_image(image, caption=None):
         st.image(image, caption=caption, use_column_width=True)
 
 
+def fmt(value, digits=2, suffix=""):
+    try:
+        return f"{float(value):.{digits}f}{suffix}"
+    except Exception:
+        return f"0.{'0' * digits}{suffix}"
+
+
 NUTRITION_KEYS = [
     "energi",
     "lemak_total",
@@ -64,8 +72,8 @@ NUTRITION_KEYS = [
 ]
 
 
-def init_parsed_data():
-    return {
+EXAMPLE_PRESETS = {
+    "Kosong": {
         "product_name": "",
         "energi": 0.0,
         "lemak_total": 0.0,
@@ -77,7 +85,51 @@ def init_parsed_data():
         "natrium": 0.0,
         "natrium_benzoat": 0.0,
         "komposisi": "",
-    }
+    },
+    "Contoh Aman": {
+        "product_name": "Contoh Produk Aman",
+        "energi": 180.0,
+        "lemak_total": 5.0,
+        "lemak_jenuh": 1.5,
+        "protein": 8.0,
+        "karbohidrat": 22.0,
+        "gula": 6.0,
+        "garam": 0.5,
+        "natrium": 150.0,
+        "natrium_benzoat": 10.0,
+        "komposisi": "Tepung, susu, gula, garam.",
+    },
+    "Contoh Sedang": {
+        "product_name": "Contoh Produk Sedang",
+        "energi": 320.0,
+        "lemak_total": 15.0,
+        "lemak_jenuh": 6.0,
+        "protein": 13.0,
+        "karbohidrat": 45.0,
+        "gula": 22.0,
+        "garam": 1.8,
+        "natrium": 600.0,
+        "natrium_benzoat": 130.0,
+        "komposisi": "Tepung terigu, gula, minyak nabati, cokelat bubuk, pengembang, garam.",
+    },
+    "Contoh Tinggi": {
+        "product_name": "Contoh Produk Tinggi",
+        "energi": 550.0,
+        "lemak_total": 30.0,
+        "lemak_jenuh": 14.0,
+        "protein": 22.0,
+        "karbohidrat": 75.0,
+        "gula": 45.0,
+        "garam": 4.0,
+        "natrium": 1500.0,
+        "natrium_benzoat": 300.0,
+        "komposisi": "Gula, sirup fruktosa, minyak nabati terhidrogenasi, penguat rasa, pengawet natrium benzoat, perisa sintetik.",
+    },
+}
+
+
+def init_parsed_data():
+    return dict(EXAMPLE_PRESETS["Kosong"])
 
 
 if "ocr_data" not in st.session_state:
@@ -132,15 +184,16 @@ def build_nutrition_data(
 
 
 def render_risk_status(risk_score):
+    risk_info = classify_risk(risk_score)
     st.metric("Skor Risiko Prediksi", f"{risk_score:.2f}%")
-    if risk_score >= 75:
-        st.error("Risiko sangat tinggi")
-    elif risk_score >= 50:
-        st.warning("Risiko tinggi")
-    elif risk_score >= 25:
-        st.warning("Risiko sedang")
+    st.metric("Klasifikasi", risk_info["label"])
+
+    if risk_info["style"] == "success":
+        st.success(f"Klasifikasi {risk_info['label']}")
+    elif risk_info["style"] == "warning":
+        st.warning(f"Klasifikasi {risk_info['label']}")
     else:
-        st.success("Risiko rendah")
+        st.error(f"Klasifikasi {risk_info['label']}")
 
 
 def render_xai_radar(xai_factors):
@@ -151,14 +204,21 @@ def render_xai_radar(xai_factors):
     norm_values = []
     for key, value in xai_factors.items():
         key_lower = key.lower()
+        value = float(value or 0)
         if "gula" in key_lower:
-            norm_values.append(min((value / 50) * 100, 100))
+            norm_values.append(min((value / 45) * 100, 100))
         elif "natrium" in key_lower and "benzoat" not in key_lower:
             norm_values.append(min((value / 1500) * 100, 100))
-        elif "lemak" in key_lower:
-            norm_values.append(min((value / 67) * 100, 100))
+        elif "benzoat" in key_lower:
+            norm_values.append(min((value / 300) * 100, 100))
+        elif "lemak total" in key_lower:
+            norm_values.append(min((value / 30) * 100, 100))
+        elif "lemak jenuh" in key_lower:
+            norm_values.append(min((value / 14) * 100, 100))
         elif "energi" in key_lower:
-            norm_values.append(min((value / 2000) * 100, 100))
+            norm_values.append(min((value / 550) * 100, 100))
+        elif "karbohidrat" in key_lower:
+            norm_values.append(min((value / 75) * 100, 100))
         else:
             norm_values.append(min((value / 100) * 100, 100))
 
@@ -181,33 +241,41 @@ def render_xai_radar(xai_factors):
 
 
 def render_health_metrics(nutrition_data, takaran_saji, current_threshold):
-    st.markdown("### Profil Gizi Ringkas")
+    st.markdown("### Profil Gizi dan Makronutrien")
 
-    energi = nutrition_data["energi"]
-    gula = nutrition_data["gula"]
-    natrium = nutrition_data["natrium"]
-    lemak_jenuh = nutrition_data["lemak_jenuh"]
+    energi = float(nutrition_data["energi"])
+    gula = float(nutrition_data["gula"])
+    natrium = float(nutrition_data["natrium"])
+    lemak_jenuh = float(nutrition_data["lemak_jenuh"])
+    karbohidrat = float(nutrition_data["karbohidrat"])
 
     kepadatan = energi / takaran_saji if takaran_saji > 0 else 0
+    rasio_gula_karbo = (gula / karbohidrat * 100) if karbohidrat > 0 else 0
+
     col1, col2, col3 = st.columns(3)
     col1.metric("Kepadatan Energi", f"{kepadatan:.2f} kkal/g")
-    col2.metric("Gula per Saji", f"{gula:.1f} g")
+    col2.metric("Rasio Gula dari Karbohidrat", f"{rasio_gula_karbo:.2f}%")
     col3.metric("Natrium per Saji", f"{natrium:.0f} mg")
 
-    st.write("Pemakaian batas harian berdasarkan profil pengguna:")
+    st.write("Pemenuhan angka kecukupan gizi harian berdasarkan profil pengguna:")
     gula_pct = (gula / current_threshold["gula"] * 100) if current_threshold["gula"] else 0
     natrium_pct = (natrium / current_threshold["natrium"] * 100) if current_threshold["natrium"] else 0
     lemak_jenuh_pct = (lemak_jenuh / current_threshold["lemak_jenuh"] * 100) if current_threshold["lemak_jenuh"] else 0
 
-    st.write(f"Gula: {gula_pct:.1f}% dari batas harian")
-    st.progress(min(int(gula_pct), 100))
-    st.write(f"Natrium: {natrium_pct:.1f}% dari batas harian")
-    st.progress(min(int(natrium_pct), 100))
-    st.write(f"Lemak jenuh: {lemak_jenuh_pct:.1f}% dari batas harian")
-    st.progress(min(int(lemak_jenuh_pct), 100))
+    st.write(f"Gula: {gula:.2f} g dari batas {current_threshold['gula']:.2f} g per hari. Persentase: {gula_pct:.2f}%")
+    st.progress(min(int(round(gula_pct)), 100))
+    st.write(f"Natrium: {natrium:.0f} mg dari batas {current_threshold['natrium']:.0f} mg per hari. Persentase: {natrium_pct:.2f}%")
+    st.progress(min(int(round(natrium_pct)), 100))
+    st.write(f"Lemak jenuh: {lemak_jenuh:.2f} g dari batas {current_threshold['lemak_jenuh']:.2f} g per hari. Persentase: {lemak_jenuh_pct:.2f}%")
+    st.progress(min(int(round(lemak_jenuh_pct)), 100))
 
 
 def run_product_analysis(product_name, takaran_saji, nutrition_data, komposisi, current_threshold):
+    if not has_sufficient_input(nutrition_data):
+        st.warning("Data belum cukup untuk dianalisis. Isi atau koreksi minimal satu nilai gizi yang valid sebelum menjalankan rekomendasi.")
+        st.info("Sistem tidak akan memberi label tinggi, sedang, atau aman ketika data masih kosong. Ini menjaga integritas hasil analisis.")
+        return
+
     risk_score, xai_factors, recommendation = analyze_product_fully(
         nutrition_data,
         komposisi,
@@ -217,10 +285,12 @@ def run_product_analysis(product_name, takaran_saji, nutrition_data, komposisi, 
         scaler,
     )
 
+    risk_info = classify_risk(risk_score)
     st.session_state.scan_history.append({
         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "product_name": product_name or "Produk Tanpa Nama",
-        "risk_score": risk_score,
+        "risk_score": round(risk_score, 2),
+        "classification": risk_info["label"],
         "nutrition": nutrition_data,
     })
 
@@ -243,19 +313,19 @@ def input_form(prefix, defaults):
     product_name = st.text_input("Nama Produk", value=defaults.get("product_name", ""), key=f"{prefix}_name")
 
     c0, c1, c2 = st.columns(3)
-    takaran_saji = c0.number_input("Takaran Saji g atau ml", min_value=1.0, value=30.0, format="%.1f", key=f"{prefix}_saji")
-    energi = c1.number_input("Energi kkal", min_value=0.0, value=float(defaults.get("energi", 0)), format="%.1f", key=f"{prefix}_energi")
-    lemak_total = c2.number_input("Lemak Total g", min_value=0.0, value=float(defaults.get("lemak_total", 0)), format="%.1f", key=f"{prefix}_lemak")
+    takaran_saji = c0.number_input("Takaran Saji g atau ml", min_value=1.0, value=100.0, format="%.2f", key=f"{prefix}_saji")
+    energi = c1.number_input("Energi kkal", min_value=0.0, value=float(defaults.get("energi", 0)), format="%.2f", key=f"{prefix}_energi")
+    lemak_total = c2.number_input("Lemak Total g", min_value=0.0, value=float(defaults.get("lemak_total", 0)), format="%.2f", key=f"{prefix}_lemak")
 
     c3, c4, c5 = st.columns(3)
-    lemak_jenuh = c3.number_input("Lemak Jenuh g", min_value=0.0, value=float(defaults.get("lemak_jenuh", 0)), format="%.1f", key=f"{prefix}_jenuh")
-    protein = c4.number_input("Protein g", min_value=0.0, value=float(defaults.get("protein", 0)), format="%.1f", key=f"{prefix}_protein")
-    karbohidrat = c5.number_input("Karbohidrat g", min_value=0.0, value=float(defaults.get("karbohidrat", 0)), format="%.1f", key=f"{prefix}_karbo")
+    lemak_jenuh = c3.number_input("Lemak Jenuh g", min_value=0.0, value=float(defaults.get("lemak_jenuh", 0)), format="%.2f", key=f"{prefix}_jenuh")
+    protein = c4.number_input("Protein g", min_value=0.0, value=float(defaults.get("protein", 0)), format="%.2f", key=f"{prefix}_protein")
+    karbohidrat = c5.number_input("Karbohidrat g", min_value=0.0, value=float(defaults.get("karbohidrat", 0)), format="%.2f", key=f"{prefix}_karbo")
 
     c6, c7, c8, c9 = st.columns(4)
-    gula = c6.number_input("Gula g", min_value=0.0, value=float(defaults.get("gula", 0)), format="%.1f", key=f"{prefix}_gula")
+    gula = c6.number_input("Gula g", min_value=0.0, value=float(defaults.get("gula", 0)), format="%.2f", key=f"{prefix}_gula")
     garam = c7.number_input("Garam g", min_value=0.0, value=float(defaults.get("garam", 0)), format="%.2f", key=f"{prefix}_garam")
-    natrium = c8.number_input("Natrium mg", min_value=0.0, value=float(defaults.get("natrium", 0)), format="%.0f", key=f"{prefix}_natrium")
+    natrium = c8.number_input("Natrium mg", min_value=0.0, value=float(defaults.get("natrium", 0)), format="%.2f", key=f"{prefix}_natrium")
     natrium_benzoat = c9.number_input("Natrium Benzoat mg", min_value=0.0, value=float(defaults.get("natrium_benzoat", 0)), format="%.2f", key=f"{prefix}_benzoat")
 
     komposisi = st.text_area("Komposisi", value=defaults.get("komposisi", ""), height=120, key=f"{prefix}_komposisi")
@@ -306,10 +376,10 @@ with st.sidebar:
         current_threshold["natrium"] = 1500
 
     with st.expander("Lihat batas harian"):
-        st.write(f"Kalori: {current_threshold['kalori']:.0f} kkal")
-        st.write(f"Gula: {current_threshold['gula']:.1f} g")
-        st.write(f"Lemak jenuh: {current_threshold['lemak_jenuh']:.1f} g")
-        st.write(f"Natrium: {current_threshold['natrium']} mg")
+        st.write(f"Kalori: {current_threshold['kalori']:.2f} kkal")
+        st.write(f"Gula: {current_threshold['gula']:.2f} g")
+        st.write(f"Lemak jenuh: {current_threshold['lemak_jenuh']:.2f} g")
+        st.write(f"Natrium: {current_threshold['natrium']:.2f} mg")
 
     app_mode = st.radio(
         "Pilih Fitur",
@@ -324,30 +394,19 @@ with st.sidebar:
 
 
 st.title("SMART NutriScan AI")
-st.caption("Analisis produk pangan berbasis OCR, machine learning, dan konfirmasi data manual.")
+st.caption("Analisis produk pangan berbasis OCR, machine learning, aturan gizi terkalibrasi, dan konfirmasi data manual.")
 
 model_ready = all([feat_model, lgbm_model, w2v_model, scaler])
 if model_ready:
-    st.success("Model utama berhasil dimuat.")
+    st.success("Model utama berhasil dimuat. Skor tetap dijaga oleh aturan gizi agar klasifikasi konsisten.")
 else:
-    st.warning("Sebagian model utama belum terbaca. Aplikasi tetap berjalan dengan analisis cadangan jika dibutuhkan.")
+    st.warning("Sebagian model utama belum terbaca. Aplikasi tetap berjalan dengan analisis gizi terkalibrasi.")
 
 
 if app_mode == "Analisis Produk Tunggal":
     st.header("Analisis Produk Tunggal")
-    defaults = {
-        "product_name": "Biskuit Cokelat",
-        "energi": 180.0,
-        "lemak_total": 8.0,
-        "lemak_jenuh": 4.0,
-        "protein": 2.0,
-        "karbohidrat": 25.0,
-        "gula": 15.0,
-        "garam": 0.3,
-        "natrium": 200.0,
-        "natrium_benzoat": 0.0,
-        "komposisi": "Tepung terigu, gula, minyak nabati, cokelat bubuk, pengembang, perisa sintetik, garam.",
-    }
+    preset_name = st.selectbox("Pilih contoh uji atau isi manual", list(EXAMPLE_PRESETS.keys()), index=1)
+    defaults = dict(EXAMPLE_PRESETS[preset_name])
 
     product_name, takaran_saji, nutrition_data, komposisi = input_form("manual", defaults)
 
@@ -358,6 +417,10 @@ if app_mode == "Analisis Produk Tunggal":
 elif app_mode == "Scan from Image":
     st.header("Scan Produk Otomatis")
     st.info("Ambil foto dekat, lurus, tidak blur, dan pastikan label memenuhi sebagian besar area gambar. Setelah OCR selesai, koreksi data sebelum analisis.")
+
+    if st.button("Reset Hasil OCR"):
+        st.session_state.ocr_data = init_parsed_data()
+        st.success("Hasil OCR sudah dikosongkan.")
 
     col_scan1, col_scan2 = st.columns(2)
 
@@ -420,7 +483,7 @@ elif app_mode == "Scan from Image":
 
 elif app_mode == "Analisis Batch Excel":
     st.header("Analisis Batch Excel")
-    st.write("Upload file Excel dengan kolom Nama Produk, Energi, Lemak, Karbohidrat, Gula, Protein, Garam, Natrium, Natrium Benzoat, dan Komposisi jika tersedia.")
+    st.write("Upload file Excel dengan kolom Nama Produk, Energi, Lemak, Lemak Jenuh, Karbohidrat, Gula, Protein, Garam, Natrium, Natrium Benzoat, dan Komposisi jika tersedia.")
 
     uploaded_file = st.file_uploader("Upload Excel", type=["xlsx"])
     if uploaded_file is not None:
@@ -431,7 +494,7 @@ elif app_mode == "Analisis Batch Excel":
         for _, row in df_clean.iterrows():
             nutrition_data = {
                 "energi": row.get("Energi", 0),
-                "lemak_total": row.get("Lemak", 0),
+                "lemak_total": row.get("Lemak", row.get("Lemak Total", 0)),
                 "lemak_jenuh": row.get("Lemak Jenuh", 0),
                 "protein": row.get("Protein", 0),
                 "karbohidrat": row.get("Karbohidrat", 0),
@@ -441,6 +504,17 @@ elif app_mode == "Analisis Batch Excel":
                 "natrium_benzoat": row.get("Natrium Benzoat", 0),
             }
             komposisi = row.get("Komposisi", "")
+            product_name = row.get("Nama Produk", row.get("Produk", "Produk Tanpa Nama"))
+
+            if not has_sufficient_input(nutrition_data):
+                results.append({
+                    "Nama Produk": product_name,
+                    "Skor Risiko": "Data belum cukup",
+                    "Klasifikasi": "Belum dianalisis",
+                    "Rekomendasi": "Isi nilai gizi yang valid sebelum analisis.",
+                })
+                continue
+
             risk_score, _, recommendation = analyze_product_fully(
                 nutrition_data,
                 komposisi,
@@ -449,9 +523,11 @@ elif app_mode == "Analisis Batch Excel":
                 w2v_model,
                 scaler,
             )
+            risk_info = classify_risk(risk_score)
             results.append({
-                "Nama Produk": row.get("Nama Produk", row.get("Produk", "Produk Tanpa Nama")),
+                "Nama Produk": product_name,
                 "Skor Risiko": round(risk_score, 2),
+                "Klasifikasi": risk_info["label"],
                 "Rekomendasi": recommendation,
             })
 
@@ -479,9 +555,11 @@ elif app_mode == "Edukasi Gizi":
         **Cara membaca hasil aplikasi:**
 
         1. OCR hanya membantu mengisi data awal, bukan pengganti validasi pengguna.
-        2. Gula tinggi perlu diperhatikan karena berpengaruh pada beban asupan harian.
-        3. Natrium tinggi perlu dibatasi, terutama pada pengguna dengan risiko hipertensi.
-        4. Lemak jenuh tinggi sebaiknya tidak dikonsumsi terlalu sering.
-        5. Komposisi dengan pemanis buatan, pewarna sintetik, pengawet, dan penguat rasa menandakan indikasi produk ultra proses.
+        2. Data kosong tidak dianalisis agar aplikasi tidak memberi klasifikasi palsu.
+        3. Klasifikasi Aman, Sedang, dan Tinggi memakai satu fungsi keputusan.
+        4. Gula tinggi perlu diperhatikan karena berpengaruh pada beban asupan harian.
+        5. Natrium tinggi perlu dibatasi, terutama pada pengguna dengan risiko hipertensi.
+        6. Lemak jenuh tinggi sebaiknya tidak dikonsumsi terlalu sering.
+        7. Komposisi dengan pemanis buatan, pewarna sintetik, pengawet, dan penguat rasa menandakan indikasi produk ultra proses.
         """
     )

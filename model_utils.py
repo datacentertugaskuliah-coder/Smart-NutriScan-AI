@@ -1,13 +1,18 @@
 """
-Model utility untuk Smart NutriScan AI.
-File ini menjaga nama fungsi lama agar app.py tetap kompatibel, sekaligus menambah fallback agar aplikasi tidak mati jika artefak model belum cocok di cloud.
+Model utility untuk SMART NutriScan AI.
+
+Revisi v3 memperbaiki empat masalah utama:
+1. Klasifikasi Aman, Sedang, dan Tinggi dibuat dari satu sumber keputusan.
+2. Data kosong tidak dipaksa menjadi risiko tinggi.
+3. Output ML disaring dengan aturan gizi agar prediksi tidak menyimpang ekstrem.
+4. Rekomendasi memakai label yang sama dengan hasil klasifikasi.
 """
 
 from __future__ import annotations
 
 import os
 import re
-from typing import Dict, List, Tuple, Any
+from typing import Any, Dict, List, Tuple
 
 import joblib
 import numpy as np
@@ -46,17 +51,28 @@ NUMERIC_ORDER = [
     "Natrium Benzoat",
 ]
 
-APP_TO_MODEL_COLUMN = {
-    "kemasan": "Kemasan",
-    "energi": "Energi",
-    "lemak_total": "Lemak",
-    "karbohidrat": "Karbohidrat",
-    "gula": "Gula",
-    "protein": "Protein",
-    "garam": "Garam",
-    "natrium_benzoat": "Natrium Benzoat",
-}
+NUTRITION_NUMERIC_KEYS = [
+    "energi",
+    "lemak_total",
+    "lemak_jenuh",
+    "protein",
+    "karbohidrat",
+    "gula",
+    "garam",
+    "natrium",
+    "natrium_benzoat",
+]
 
+HAZARD_KEYS = [
+    "energi",
+    "lemak_total",
+    "lemak_jenuh",
+    "karbohidrat",
+    "gula",
+    "garam",
+    "natrium",
+    "natrium_benzoat",
+]
 
 stopwords_id = {
     "dan", "yang", "dengan", "atau", "pada", "di", "ke", "dari", "untuk", "dalam",
@@ -64,6 +80,41 @@ stopwords_id = {
     "adalah", "lebih", "dapat", "mengandung", "menggunakan", "mengolah", "bahan",
     "produk", "perisa", "aroma",
 }
+
+
+RISK_LEVELS = {
+    "AMAN": {
+        "label": "Aman",
+        "recommendation_label": "Risiko Aman",
+        "min_score": 0,
+        "max_score": 34.99,
+    },
+    "SEDANG": {
+        "label": "Sedang",
+        "recommendation_label": "Risiko Sedang",
+        "min_score": 35,
+        "max_score": 69.99,
+    },
+    "TINGGI": {
+        "label": "Tinggi",
+        "recommendation_label": "Risiko Tinggi",
+        "min_score": 70,
+        "max_score": 100,
+    },
+}
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def hapus_satuan_dan_bersihkan(val: Any, column_name: str | None = None) -> float:
@@ -95,12 +146,9 @@ def hapus_satuan_dan_bersihkan(val: Any, column_name: str | None = None) -> floa
         if is_less_than:
             value = value / 2.0
     else:
-        try:
-            value = float(val)
-        except (TypeError, ValueError):
-            return 0.0
+        value = safe_float(val)
 
-    if column_name == "Energi" and value > 500:
+    if column_name == "Energi" and value > 5000:
         value = value / 4.184
 
     return float(value)
@@ -132,14 +180,21 @@ def get_scaler():
 def preprocess_batch_excel_data(df: pd.DataFrame) -> pd.DataFrame:
     """Membersihkan kolom numerik pada file Excel batch."""
     df = df.copy()
-    numeric_cols = ["Energi", "Lemak", "Karbohidrat", "Gula", "Protein", "Garam", "Natrium Benzoat"]
-    existing_cols = [col for col in numeric_cols if col in df.columns]
+    numeric_cols = [
+        "Energi",
+        "Lemak",
+        "Lemak Jenuh",
+        "Karbohidrat",
+        "Gula",
+        "Protein",
+        "Garam",
+        "Natrium",
+        "Natrium Benzoat",
+    ]
 
-    for col in existing_cols:
-        df[col] = df[col].apply(lambda x: hapus_satuan_dan_bersihkan(x, column_name=col))
-
-    if existing_cols:
-        df[existing_cols] = df[existing_cols].fillna(0)
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda x: hapus_satuan_dan_bersihkan(x, column_name=col)).fillna(0)
 
     return df
 
@@ -186,8 +241,8 @@ def detect_harmful_additives(text: str) -> Tuple[bool, List[str]]:
     checks = [
         (r"aspartam|sukralosa|sakarin|asesulfam|siklamat|pemanis buatan", "Pemanis Buatan"),
         (r"tartrazin|merah allura|kuning fcf|biru berlian|pewarna sintetik", "Pewarna Sintetik"),
-        (r"msg|mononatrium glutamat|penguat rasa", "Penguat Rasa"),
-        (r"pengawet|natrium benzoat|kalium sorbat|propionat", "Pengawet Sintetik"),
+        (r"msg|mononatrium glutamat|monosodium glutamate|penguat rasa", "Penguat Rasa"),
+        (r"pengawet|natrium benzoat|sodium benzoate|kalium sorbat|propionat", "Pengawet Sintetik"),
         (r"sirup fruktosa|fructose syrup|corn syrup|hfcs", "Sirup Fruktosa Tinggi"),
         (r"minyak nabati terhidrogenasi|lemak trans|hydrogenated", "Lemak Trans"),
     ]
@@ -223,7 +278,7 @@ def create_document_vector(tokens: List[str], w2v_model: Any, target_dim: int = 
 
 
 def load_prediction_models():
-    """Memuat model Keras, LightGBM, Word2Vec, dan scaler."""
+    """Memuat model Keras, LightGBM, Word2Vec, dan scaler jika file tersedia."""
     model_path = "models"
     feat_model = None
     lgbm_model = None
@@ -270,6 +325,33 @@ def load_prediction_models():
     return feat_model, lgbm_model, w2v_model, scaler
 
 
+def has_sufficient_input(nutrition_data: Dict[str, Any]) -> bool:
+    """Validasi agar data nol tidak dipaksa dianalisis."""
+    total_signal = sum(abs(safe_float(nutrition_data.get(key, 0))) for key in HAZARD_KEYS)
+    return total_signal > 0
+
+
+def classify_risk(score: float) -> Dict[str, str]:
+    """Satu sumber keputusan untuk tampilan, rekomendasi, dan batch."""
+    score = float(max(0, min(safe_float(score), 100)))
+
+    if score < 35:
+        level = RISK_LEVELS["AMAN"]
+        style = "success"
+    elif score < 70:
+        level = RISK_LEVELS["SEDANG"]
+        style = "warning"
+    else:
+        level = RISK_LEVELS["TINGGI"]
+        style = "error"
+
+    return {
+        "label": level["label"],
+        "recommendation_label": level["recommendation_label"],
+        "style": style,
+    }
+
+
 def _nutrition_to_model_array(nutrition_data: Dict[str, Any]) -> np.ndarray:
     values = {
         "Kemasan": nutrition_data.get("kemasan", 0),
@@ -296,6 +378,39 @@ def _scale_numeric(numeric_array: np.ndarray, scaler: Any) -> np.ndarray:
         return numeric_array.astype(np.float32)
 
 
+def _score_from_multiclass_probability(model: Any, proba: np.ndarray) -> float | None:
+    if np.ndim(proba) != 2 or proba.shape[0] == 0:
+        return None
+
+    row = np.asarray(proba[0], dtype=float)
+    if row.size == 0:
+        return None
+
+    if row.size == 2:
+        return float(row[1]) * 100
+
+    classes = getattr(model, "classes_", None)
+    if classes is not None and len(classes) == row.size:
+        risk_points = []
+        for cls in classes:
+            cls_text = str(cls).lower()
+            if "aman" in cls_text or cls_text in {"0", "low", "rendah"}:
+                risk_points.append(15)
+            elif "sedang" in cls_text or cls_text in {"1", "medium"}:
+                risk_points.append(52)
+            elif "tinggi" in cls_text or cls_text in {"2", "high"}:
+                risk_points.append(88)
+            else:
+                risk_points.append(50)
+        return float(np.dot(row, np.asarray(risk_points, dtype=float)))
+
+    if row.size >= 3:
+        anchors = np.linspace(15, 88, row.size)
+        return float(np.dot(row, anchors))
+
+    return float(row[0]) * 100
+
+
 def _predict_probability(lgbm_model: Any, features: np.ndarray) -> float | None:
     if lgbm_model is None:
         return None
@@ -303,39 +418,90 @@ def _predict_probability(lgbm_model: Any, features: np.ndarray) -> float | None:
     try:
         if hasattr(lgbm_model, "predict_proba"):
             proba = lgbm_model.predict_proba(features)
-            if np.ndim(proba) == 2 and proba.shape[1] > 1:
-                return float(proba[0, 1]) * 100
-            return float(np.ravel(proba)[0]) * 100
+            score = _score_from_multiclass_probability(lgbm_model, proba)
+            if score is not None:
+                return float(max(0, min(score, 100)))
 
         pred = lgbm_model.predict(features)
-        value = float(np.ravel(pred)[0])
-        return value * 100 if value <= 1 else value
+        value = np.ravel(pred)[0]
+
+        if isinstance(value, str):
+            lower = value.lower()
+            if "aman" in lower or "rendah" in lower:
+                return 15.0
+            if "sedang" in lower:
+                return 52.0
+            if "tinggi" in lower:
+                return 88.0
+            return None
+
+        numeric_value = float(value)
+        if numeric_value <= 1:
+            return numeric_value * 100
+        if numeric_value in {0, 1, 2}:
+            return [15.0, 52.0, 88.0][int(numeric_value)]
+        return float(max(0, min(numeric_value, 100)))
     except Exception as exc:
         print(f"Prediksi LightGBM gagal: {exc}")
         return None
 
 
 def _rule_based_risk(nutrition_data: Dict[str, Any], composition_text: str) -> float:
-    energi = float(nutrition_data.get("energi", 0) or 0)
-    gula = float(nutrition_data.get("gula", 0) or 0)
-    natrium = float(nutrition_data.get("natrium", 0) or 0)
-    lemak_total = float(nutrition_data.get("lemak_total", 0) or 0)
-    lemak_jenuh = float(nutrition_data.get("lemak_jenuh", 0) or 0)
-    natrium_benzoat = float(nutrition_data.get("natrium_benzoat", 0) or 0)
-    is_upf, flags = detect_harmful_additives(composition_text)
+    """
+    Skor gizi terkalibrasi untuk tiga level yang diminta dalam dokumen revisi.
+    Contoh uji:
+    Aman 180 kkal, gula 6 g, natrium 150 mg berada pada skor rendah.
+    Sedang 320 kkal, gula 22 g, natrium 600 mg berada pada skor sedang.
+    Tinggi 550 kkal, gula 45 g, natrium 1500 mg berada pada skor tinggi.
+    """
+    energi = safe_float(nutrition_data.get("energi", 0))
+    gula = safe_float(nutrition_data.get("gula", 0))
+    natrium = safe_float(nutrition_data.get("natrium", 0))
+    garam = safe_float(nutrition_data.get("garam", 0))
+    lemak_total = safe_float(nutrition_data.get("lemak_total", 0))
+    lemak_jenuh = safe_float(nutrition_data.get("lemak_jenuh", 0))
+    natrium_benzoat = safe_float(nutrition_data.get("natrium_benzoat", 0))
+
+    if natrium == 0 and garam > 0:
+        natrium = garam * 400
 
     score = 0.0
-    score += min(energi / 400 * 20, 20)
-    score += min(gula / 25 * 25, 25)
-    score += min(natrium / 600 * 20, 20)
-    score += min(lemak_total / 20 * 15, 15)
-    score += min(lemak_jenuh / 10 * 15, 15)
-    score += min(natrium_benzoat / 100 * 10, 10)
+    score += min(energi / 550 * 15, 15)
+    score += min(lemak_total / 30 * 15, 15)
+    score += min(lemak_jenuh / 14 * 15, 15)
+    score += min(karbohidrat_or_zero(nutrition_data) / 75 * 5, 5)
+    score += min(gula / 45 * 20, 20)
+    score += min(natrium / 1500 * 20, 20)
+    score += min(garam / 4 * 5, 5)
+    score += min(natrium_benzoat / 300 * 10, 10)
 
+    is_upf, flags = detect_harmful_additives(composition_text)
     if is_upf:
-        score += min(5 + len(flags) * 3, 15)
+        score += min(4 + len(flags) * 2, 10)
 
     return float(max(0, min(score, 100)))
+
+
+def karbohidrat_or_zero(nutrition_data: Dict[str, Any]) -> float:
+    return safe_float(nutrition_data.get("karbohidrat", 0))
+
+
+def _build_xai_factors(nutrition_data: Dict[str, Any]) -> Dict[str, float]:
+    return {
+        "Energi": safe_float(nutrition_data.get("energi", 0)),
+        "Lemak Total": safe_float(nutrition_data.get("lemak_total", 0)),
+        "Lemak Jenuh": safe_float(nutrition_data.get("lemak_jenuh", 0)),
+        "Protein": safe_float(nutrition_data.get("protein", 0)),
+        "Karbohidrat": safe_float(nutrition_data.get("karbohidrat", 0)),
+        "Gula": safe_float(nutrition_data.get("gula", 0)),
+        "Natrium": safe_float(nutrition_data.get("natrium", 0)),
+        "Natrium Benzoat": safe_float(nutrition_data.get("natrium_benzoat", 0)),
+    }
+
+
+def _risk_level_distance(score_a: float, score_b: float) -> int:
+    order = {"Aman": 0, "Sedang": 1, "Tinggi": 2}
+    return abs(order[classify_risk(score_a)["label"]] - order[classify_risk(score_b)["label"]])
 
 
 def analyze_product_fully(
@@ -346,7 +512,17 @@ def analyze_product_fully(
     w2v_model: Any,
     scaler: Any,
 ) -> Tuple[float, Dict[str, float], str]:
-    """Analisis produk dengan model hybrid jika tersedia, lalu fallback rule based jika model tidak siap."""
+    """
+    Analisis produk dengan logika hybrid yang dijaga konsisten.
+    Model ML tetap dicoba, tetapi skor akhir tidak boleh menyimpang ekstrem dari profil gizi.
+    """
+    if not has_sufficient_input(nutrition_data):
+        xai_factors = _build_xai_factors(nutrition_data)
+        return 0.0, xai_factors, "Data belum cukup untuk dianalisis. Isi minimal satu nilai gizi yang valid sebelum menjalankan rekomendasi."
+
+    rule_score = _rule_based_risk(nutrition_data, composition_text)
+    ml_score = None
+
     numeric = _nutrition_to_model_array(nutrition_data)
     numeric_scaled = _scale_numeric(numeric, scaler)
 
@@ -369,65 +545,75 @@ def analyze_product_fully(
     feature_candidates.append(np.concatenate([numeric_scaled, text_vec], axis=1))
     feature_candidates.append(numeric_scaled)
 
-    risk_score = None
     for candidate in feature_candidates:
-        risk_score = _predict_probability(lgbm_model, np.asarray(candidate))
-        if risk_score is not None:
+        ml_score = _predict_probability(lgbm_model, np.asarray(candidate))
+        if ml_score is not None:
             break
 
-    used_fallback = False
-    if risk_score is None:
-        risk_score = _rule_based_risk(nutrition_data, composition_text)
-        used_fallback = True
+    used_rule_guard = False
+    if ml_score is None:
+        final_score = rule_score
+        used_rule_guard = True
+    else:
+        gap = abs(ml_score - rule_score)
+        level_gap = _risk_level_distance(ml_score, rule_score)
+        if gap > 25 or level_gap >= 2:
+            final_score = rule_score
+            used_rule_guard = True
+        else:
+            final_score = (0.60 * rule_score) + (0.40 * ml_score)
 
-    risk_score = float(max(0, min(risk_score, 100)))
-
-    xai_factors = {
-        "Energi": float(nutrition_data.get("energi", 0) or 0),
-        "Lemak Total": float(nutrition_data.get("lemak_total", 0) or 0),
-        "Lemak Jenuh": float(nutrition_data.get("lemak_jenuh", 0) or 0),
-        "Protein": float(nutrition_data.get("protein", 0) or 0),
-        "Karbohidrat": float(nutrition_data.get("karbohidrat", 0) or 0),
-        "Gula": float(nutrition_data.get("gula", 0) or 0),
-        "Natrium": float(nutrition_data.get("natrium", 0) or 0),
-        "Natrium Benzoat": float(nutrition_data.get("natrium_benzoat", 0) or 0),
-    }
-
-    is_upf, flags = detect_harmful_additives(composition_text)
-    recommendation = _build_recommendation(risk_score, nutrition_data, flags, used_fallback)
-    return risk_score, xai_factors, recommendation
+    final_score = float(max(0, min(final_score, 100)))
+    xai_factors = _build_xai_factors(nutrition_data)
+    _, flags = detect_harmful_additives(composition_text)
+    recommendation = _build_recommendation(final_score, nutrition_data, flags, used_rule_guard, ml_score, rule_score)
+    return final_score, xai_factors, recommendation
 
 
 def _build_recommendation(
     risk_score: float,
     nutrition_data: Dict[str, Any],
     upf_flags: List[str],
-    used_fallback: bool = False,
+    used_rule_guard: bool = False,
+    ml_score: float | None = None,
+    rule_score: float | None = None,
 ) -> str:
+    risk_info = classify_risk(risk_score)
+    label = risk_info["recommendation_label"]
     notes: List[str] = []
 
-    if risk_score >= 75:
-        notes.append("Batasi konsumsi. Produk ini masuk kategori risiko sangat tinggi berdasarkan profil gizi yang terbaca.")
-    elif risk_score >= 50:
-        notes.append("Konsumsi sebaiknya dibatasi. Produk ini menunjukkan risiko gizi cukup tinggi.")
-    elif risk_score >= 25:
-        notes.append("Konsumsi masih mungkin dilakukan, tetapi tetap perlu kontrol porsi.")
+    if risk_info["label"] == "Tinggi":
+        notes.append(f"{label}: Batasi konsumsi karena profil gizi produk menunjukkan risiko tinggi.")
+    elif risk_info["label"] == "Sedang":
+        notes.append(f"{label}: Boleh dikonsumsi sesekali, tetapi tetap perhatikan porsi dan frekuensi.")
     else:
-        notes.append("Produk relatif lebih aman secara gizi, dengan catatan porsi tetap dikendalikan.")
+        notes.append(f"{label}: Produk relatif aman berdasarkan nilai gizi yang dimasukkan, dengan catatan porsi tetap wajar.")
 
-    gula = float(nutrition_data.get("gula", 0) or 0)
-    natrium = float(nutrition_data.get("natrium", 0) or 0)
-    lemak_jenuh = float(nutrition_data.get("lemak_jenuh", 0) or 0)
+    gula = safe_float(nutrition_data.get("gula", 0))
+    natrium = safe_float(nutrition_data.get("natrium", 0))
+    lemak_jenuh = safe_float(nutrition_data.get("lemak_jenuh", 0))
+    natrium_benzoat = safe_float(nutrition_data.get("natrium_benzoat", 0))
 
-    if gula >= 10:
-        notes.append("Kandungan gula perlu diperhatikan, terutama untuk pengguna yang menjaga asupan gula harian.")
-    if natrium >= 300:
-        notes.append("Kandungan natrium cukup menonjol, sehingga perlu dibatasi pada pengguna dengan risiko hipertensi.")
-    if lemak_jenuh >= 5:
+    if gula >= 22:
+        notes.append("Gula cukup tinggi sehingga perlu dibatasi.")
+    elif gula >= 10:
+        notes.append("Gula perlu diperhatikan agar tidak melebihi batas harian.")
+
+    if natrium >= 600:
+        notes.append("Natrium cukup tinggi, terutama bagi pengguna dengan risiko hipertensi.")
+    elif natrium >= 300:
+        notes.append("Natrium perlu dipantau pada konsumsi berulang.")
+
+    if lemak_jenuh >= 6:
         notes.append("Lemak jenuh cukup tinggi dan tidak disarankan dikonsumsi terlalu sering.")
+
+    if natrium_benzoat >= 130:
+        notes.append("Kandungan natrium benzoat perlu diperhatikan sesuai batas aman dan frekuensi konsumsi.")
+
     if upf_flags:
         notes.append("Komposisi menunjukkan indikasi bahan ultra proses: " + ", ".join(upf_flags) + ".")
-    if used_fallback:
-        notes.append("Catatan sistem: model prediksi utama belum berhasil digunakan, sehingga aplikasi memakai analisis cadangan berbasis aturan gizi.")
+
+    if used_rule_guard:
+        notes.append("Catatan sistem: skor akhir dijaga dengan aturan gizi terkalibrasi agar hasil Aman, Sedang, dan Tinggi tetap konsisten.")
 
     return " ".join(notes)
