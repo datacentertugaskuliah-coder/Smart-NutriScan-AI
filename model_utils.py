@@ -1,381 +1,433 @@
+"""
+Model utility untuk Smart NutriScan AI.
+File ini menjaga nama fungsi lama agar app.py tetap kompatibel, sekaligus menambah fallback agar aplikasi tidak mati jika artefak model belum cocok di cloud.
+"""
+
+from __future__ import annotations
+
 import os
 import re
-import joblib  # use standalone joblib package
+from typing import Dict, List, Tuple, Any
+
+import joblib
 import numpy as np
 import pandas as pd
-import tensorflow as tf
 import scipy.linalg
 
-# Patch scipy.linalg.triu for gensim compatibility
-if not hasattr(scipy.linalg, 'triu'):
+if not hasattr(scipy.linalg, "triu"):
     scipy.linalg.triu = np.triu
 
-from gensim.models import Word2Vec
-from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras import Model
-from tensorflow.keras.initializers import Orthogonal
+try:
+    import tensorflow as tf
+    from tensorflow.keras import Model
+except Exception:
+    tf = None
+    Model = None
 
-# ==========================================
-# 1. DATA ENGINEERING & CLEANING MODULE
-# ==========================================
+try:
+    from gensim.models import Word2Vec
+except Exception:
+    Word2Vec = None
 
-def hapus_satuan_dan_bersihkan(val, column_name=None):
-    """
-    Cleans numerical values by removing units, handling both comma and dot decimal separators.
-    [UPGRADE EXPERT]: Menangani kasus edge-case seperti "< 1g" atau "~5mg".
-    
-    Handles cases like:
-    - "100g" -> 100.0
-    - "< 1g" -> 0.5 (Heuristik Data Science untuk batas bawah)
-    - "<5mg" -> 2.5
-    - "1.234,56" -> 1234.56
-    """
-    if isinstance(val, str):
-        val = val.strip().lower()
+try:
+    from sklearn.preprocessing import MinMaxScaler
+except Exception:
+    MinMaxScaler = None
 
-        # Penanganan khusus tanda "kurang dari" (<)
-        # Jika "< 1g", secara konservatif kita anggap setengahnya agar tidak 0 tapi juga tidak 1
-        is_less_than = False
-        if '<' in val:
-            is_less_than = True
 
-        # Remove non-numeric characters except dots, commas, and minus sign
-        val = re.sub(r'[^\d.,-]', '', val)
-        val = re.sub(r'(?<!^)-', '', val) # Remove minus signs except at the beginning
-        
-        if ',' in val and '.' in val:
-            if val.rindex(',') > val.rindex('.'):
-                val = val.replace('.', '').replace(',', '.')
-            else:
-                val = val.replace(',', '.')
-        else:
-            val = val.replace(',', '.')
-        
-        try:
-            if val == '': return 0.0
-            result = float(val)
-            
-            # Apply heuristic for less than
-            if is_less_than:
-                result = result / 2.0
+NUMERIC_ORDER = [
+    "Kemasan",
+    "Energi",
+    "Lemak",
+    "Karbohidrat",
+    "Gula",
+    "Protein",
+    "Garam",
+    "Natrium Benzoat",
+]
 
-            if column_name == 'Energi' and result > 500:
-                result = result / 4.184
-                # print(f"Note: Converted energy value {val} Kj to {result:.1f} kkal")
-            
-            return result
-        except ValueError:
-            return np.nan
-    
-    try:
-        result = float(val)
-        if column_name == 'Energi' and result > 500:
-            result = result / 4.184
-        return result
-    except (ValueError, TypeError):
-        return np.nan
-
-def get_scaler():
-    """
-    Loads the original dataset to fit and return the MinMaxScaler.
-    This is crucial for ensuring the input data is scaled exactly
-    as the training data was.
-    """
-    try:
-        data = pd.read_excel('dataset lengkap.xlsx')
-        data = data.fillna(0)
-        df = data.drop(columns=['No'])
-
-        nutrisi_cols = ['Kemasan', 'Energi', 'Lemak', 'Karbohidrat', 'Gula',
-                        'Protein', 'Garam', 'Natrium Benzoat']
-
-        for col in nutrisi_cols:
-            df[col] = df[col].apply(lambda x: hapus_satuan_dan_bersihkan(x, column_name=col))
-        
-        df = df.fillna(0)
-
-        numeric_cols = [
-            "Kemasan", "Energi", "Lemak", "Karbohidrat",
-            "Gula", "Protein", "Garam", "Natrium Benzoat"
-        ]
-        scaler = MinMaxScaler()
-        scaler.fit(df[numeric_cols])
-        return scaler
-    except Exception as e:
-        print(f"Error creating scaler: {e}")
-        return None
-
-def preprocess_batch_excel_data(df):
-    """
-    Preprocesses batch Excel data by cleaning all numerical columns.
-    Handles units (g, mg, kkal, Kj, etc.), comma decimals, and mixed formats.
-    
-    Special handling:
-    - Energi: Converts Kj to kkal if value > 500 (detected as Kj)
-    - All columns: Removes units, handles comma/dot decimal separators
-    
-    Args:
-        df (pd.DataFrame): DataFrame read from Excel with nutrition columns
-        
-    Returns:
-        pd.DataFrame: DataFrame with cleaned numerical values
-    """
-    df = df.copy()
-    
-    # Nutrition columns that need cleaning (only process if they exist)
-    numeric_cols = ['Energi', 'Lemak', 'Karbohidrat', 'Gula', 'Protein', 'Garam', 'Natrium Benzoat']
-    existing_cols = [col for col in numeric_cols if col in df.columns]
-    
-    for col in existing_cols:
-        # Pass column name for special handling (e.g., Kj to kkal conversion)
-        df[col] = df[col].apply(lambda x: hapus_satuan_dan_bersihkan(x, column_name=col))
-    
-    # Fill any NaN values with 0 (only in existing columns)
-    df[existing_cols] = df[existing_cols].fillna(0)
-    
-    return df
-
-# ==========================================
-# 2. NLP & TEXT MINING MODULE
-# ==========================================
-
-stopwords_id = {
-    'dan','yang','dengan','atau','pada','di','ke','dari','untuk','dalam','sebagai','oleh',
-    'tanpa','agar','karena','juga','serta','ini','itu','adalah','lebih','dapat','mengandung',
-    'menggunakan','mengolah','bahan','produk','perisa','aroma'
+APP_TO_MODEL_COLUMN = {
+    "kemasan": "Kemasan",
+    "energi": "Energi",
+    "lemak_total": "Lemak",
+    "karbohidrat": "Karbohidrat",
+    "gula": "Gula",
+    "protein": "Protein",
+    "garam": "Garam",
+    "natrium_benzoat": "Natrium Benzoat",
 }
 
-def filtering_tokens(tokens, min_len=3, remove_numbers=True):
-    hasil = []
-    for t in tokens:
-        t = t.strip()
-        if not t: continue
-        t = re.sub(r'[^a-z0-9]', '', t)
-        if not t: continue
-        if remove_numbers and t.isdigit(): continue
-        if len(t) < min_len: continue
-        if t in stopwords_id: continue
-        hasil.append(t)
+
+stopwords_id = {
+    "dan", "yang", "dengan", "atau", "pada", "di", "ke", "dari", "untuk", "dalam",
+    "sebagai", "oleh", "tanpa", "agar", "karena", "juga", "serta", "ini", "itu",
+    "adalah", "lebih", "dapat", "mengandung", "menggunakan", "mengolah", "bahan",
+    "produk", "perisa", "aroma",
+}
+
+
+def hapus_satuan_dan_bersihkan(val: Any, column_name: str | None = None) -> float:
+    """Membersihkan angka nutrisi dari satuan seperti g, mg, kkal, dan kJ."""
+    if pd.isna(val):
+        return 0.0
+
+    if isinstance(val, str):
+        raw = val.strip().lower()
+        is_less_than = "<" in raw
+        raw = re.sub(r"[^\d.,-]", "", raw)
+
+        if raw.count(",") > 0 and raw.count(".") > 0:
+            if raw.rfind(",") > raw.rfind("."):
+                raw = raw.replace(".", "").replace(",", ".")
+            else:
+                raw = raw.replace(",", "")
+        else:
+            raw = raw.replace(",", ".")
+
+        if raw in {"", ".", "-"}:
+            return 0.0
+
+        try:
+            value = float(raw)
+        except ValueError:
+            return 0.0
+
+        if is_less_than:
+            value = value / 2.0
+    else:
+        try:
+            value = float(val)
+        except (TypeError, ValueError):
+            return 0.0
+
+    if column_name == "Energi" and value > 500:
+        value = value / 4.184
+
+    return float(value)
+
+
+def get_scaler():
+    """Membuat scaler dari dataset jika scaler joblib tidak tersedia."""
+    if MinMaxScaler is None:
+        return None
+
+    try:
+        data = pd.read_excel("dataset lengkap.xlsx").fillna(0)
+        df = data.drop(columns=["No"], errors="ignore")
+
+        for col in NUMERIC_ORDER:
+            if col in df.columns:
+                df[col] = df[col].apply(lambda x: hapus_satuan_dan_bersihkan(x, column_name=col))
+            else:
+                df[col] = 0.0
+
+        scaler = MinMaxScaler()
+        scaler.fit(df[NUMERIC_ORDER])
+        return scaler
+    except Exception as exc:
+        print(f"Scaler fallback gagal dibuat: {exc}")
+        return None
+
+
+def preprocess_batch_excel_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Membersihkan kolom numerik pada file Excel batch."""
+    df = df.copy()
+    numeric_cols = ["Energi", "Lemak", "Karbohidrat", "Gula", "Protein", "Garam", "Natrium Benzoat"]
+    existing_cols = [col for col in numeric_cols if col in df.columns]
+
+    for col in existing_cols:
+        df[col] = df[col].apply(lambda x: hapus_satuan_dan_bersihkan(x, column_name=col))
+
+    if existing_cols:
+        df[existing_cols] = df[existing_cols].fillna(0)
+
+    return df
+
+
+def filtering_tokens(tokens: List[str], min_len: int = 3, remove_numbers: bool = True) -> List[str]:
+    hasil: List[str] = []
+
+    for token in tokens:
+        token = token.strip().lower()
+        token = re.sub(r"[^a-z0-9]", "", token)
+
+        if not token:
+            continue
+        if remove_numbers and token.isdigit():
+            continue
+        if len(token) < min_len:
+            continue
+        if token in stopwords_id:
+            continue
+
+        hasil.append(token)
+
     return hasil
 
-def tokenize_and_clean_text(text: str):
-    if pd.isna(text): return []
-    s = str(text).lower()
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return filtering_tokens(s.split())
 
-def detect_harmful_additives(text: str):
-    """
-    [FITUR EXPERT]: Natural Language Processing (Rule-based)
-    Mendeteksi bahan-bahan Ultra-Processed Food (UPF) dari teks komposisi.
-    Ini menambah value "Explainability" pada sistem AI.
-    """
-    if pd.isna(text) or text == "":
+def tokenize_and_clean_text(text: str) -> List[str]:
+    if pd.isna(text):
+        return []
+
+    value = str(text).lower()
+    value = re.sub(r"[^a-z0-9\s]", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return filtering_tokens(value.split())
+
+
+def detect_harmful_additives(text: str) -> Tuple[bool, List[str]]:
+    """Deteksi sederhana bahan ultra proses dari teks komposisi."""
+    if pd.isna(text) or str(text).strip() == "":
         return False, []
 
-    text = str(text).lower()
-    red_flags = []
+    lower_text = str(text).lower()
+    red_flags: List[str] = []
 
-    # Kamus NLP sederhana untuk deteksi zat aditif berisiko
-    if re.search(r'aspartam|sukralosa|sakarin|asesulfam|siklamat|pemanis buatan', text):
-        red_flags.append("Pemanis Buatan")
-    if re.search(r'tartrazin|merah allura|kuning fcf|biru berlian|pewarna sintetik', text):
-        red_flags.append("Pewarna Sintetik")
-    if re.search(r'msg|mononatrium glutamat|penguat rasa', text):
-        red_flags.append("Penguat Rasa (MSG)")
-    if re.search(r'pengawet|natrium benzoat|kalium sorbat|propionat', text):
-        red_flags.append("Pengawet Sintetik")
-    if re.search(r'sirup fruktosa|fructose syrup|corn syrup|hfcs', text):
-        red_flags.append("High-Fructose Corn Syrup (Risiko Obesitas)")
-    if re.search(r'minyak nabati terhidrogenasi|lemak trans|hydrogenated', text):
-        red_flags.append("Lemak Trans / Minyak Terhidrogenasi")
+    checks = [
+        (r"aspartam|sukralosa|sakarin|asesulfam|siklamat|pemanis buatan", "Pemanis Buatan"),
+        (r"tartrazin|merah allura|kuning fcf|biru berlian|pewarna sintetik", "Pewarna Sintetik"),
+        (r"msg|mononatrium glutamat|penguat rasa", "Penguat Rasa"),
+        (r"pengawet|natrium benzoat|kalium sorbat|propionat", "Pengawet Sintetik"),
+        (r"sirup fruktosa|fructose syrup|corn syrup|hfcs", "Sirup Fruktosa Tinggi"),
+        (r"minyak nabati terhidrogenasi|lemak trans|hydrogenated", "Lemak Trans"),
+    ]
 
-    is_upf = len(red_flags) > 0
-    return is_upf, red_flags
+    for pattern, label in checks:
+        if re.search(pattern, lower_text) and label not in red_flags:
+            red_flags.append(label)
 
-def create_document_vector(tokens, w2v_model, target_dim=50):
-    """Creates a document vector by averaging word vectors."""
-    wv = w2v_model.wv
-    valid_vectors = [wv[t] for t in tokens if t in wv.key_to_index]
+    return len(red_flags) > 0, red_flags
 
-    if not valid_vectors:
+
+def create_document_vector(tokens: List[str], w2v_model: Any, target_dim: int = 50) -> np.ndarray:
+    """Membuat vektor dokumen dari Word2Vec."""
+    if w2v_model is None or not hasattr(w2v_model, "wv"):
         return np.zeros(target_dim, dtype=np.float32)
 
-    mean_vector = np.mean(valid_vectors, axis=0).astype(np.float32)
+    try:
+        word_vectors = w2v_model.wv
+        valid_vectors = [word_vectors[token] for token in tokens if token in word_vectors.key_to_index]
 
-    if len(mean_vector) > target_dim:
-        mean_vector = mean_vector[:target_dim]
-    elif len(mean_vector) < target_dim:
-        mean_vector = np.pad(mean_vector, (0, target_dim - len(mean_vector)))
+        if not valid_vectors:
+            return np.zeros(target_dim, dtype=np.float32)
 
-    return mean_vector
+        mean_vector = np.mean(valid_vectors, axis=0).astype(np.float32)
+        if len(mean_vector) > target_dim:
+            mean_vector = mean_vector[:target_dim]
+        elif len(mean_vector) < target_dim:
+            mean_vector = np.pad(mean_vector, (0, target_dim - len(mean_vector)))
 
+        return mean_vector.astype(np.float32)
+    except Exception:
+        return np.zeros(target_dim, dtype=np.float32)
 
-# ==========================================
-# 3. MACHINE LEARNING & PREDICTION MODULE
-# ==========================================
 
 def load_prediction_models():
-    """Loads all models and the fitted scaler."""
-    model_path = "models/"
+    """Memuat model Keras, LightGBM, Word2Vec, dan scaler."""
+    model_path = "models"
+    feat_model = None
+    lgbm_model = None
+    w2v_model = None
+    scaler = None
+
     try:
-        base_cnn_bilstm = tf.keras.models.load_model(os.path.join(model_path, "cb1_bab3.keras"))
-        
-        try:
-            output_layer = base_cnn_bilstm.get_layer("fusion_feat").output
-        except ValueError:
-            print(f"Layer 'fusion_feat' not found. Using layer: {base_cnn_bilstm.layers[-2].name}")
-            output_layer = base_cnn_bilstm.layers[-2].output
+        if tf is not None:
+            keras_path = os.path.join(model_path, "cb1_bab3.keras")
+            if os.path.exists(keras_path):
+                base_model = tf.keras.models.load_model(keras_path)
+                try:
+                    output_layer = base_model.get_layer("fusion_feat").output
+                except Exception:
+                    output_layer = base_model.layers[-2].output if len(base_model.layers) >= 2 else base_model.output
+                feat_model = Model(inputs=base_model.inputs, outputs=output_layer, name="feature_extractor")
+    except Exception as exc:
+        print(f"Model Keras gagal dimuat: {exc}")
 
-        feat_model = Model(
-            inputs=base_cnn_bilstm.inputs,
-            outputs=output_layer,
-            name="feature_extractor"
-        )
+    try:
+        lgbm_path = os.path.join(model_path, "model_lgbm_woa_bab3.joblib")
+        if os.path.exists(lgbm_path):
+            lgbm_model = joblib.load(lgbm_path)
+    except Exception as exc:
+        print(f"Model LightGBM gagal dimuat: {exc}")
 
-        lgbm_model = joblib.load(os.path.join(model_path, "model_lgbm_woa_bab3.joblib"))
-        w2v_model = Word2Vec.load(os.path.join(model_path, "model_w2v_komposisi.model"))
-        
+    try:
+        w2v_path = os.path.join(model_path, "model_w2v_komposisi.model")
+        if Word2Vec is not None and os.path.exists(w2v_path):
+            w2v_model = Word2Vec.load(w2v_path)
+    except Exception as exc:
+        print(f"Model Word2Vec gagal dimuat: {exc}")
+
+    try:
         scaler_path = os.path.join(model_path, "scaler.joblib")
         if os.path.exists(scaler_path):
             scaler = joblib.load(scaler_path)
         else:
-            print("Warning: scaler.joblib not found. Using dummy scaler.")
-            scaler = MinMaxScaler()
-            scaler.fit(np.zeros((1, 8)))
+            scaler = get_scaler()
+    except Exception as exc:
+        print(f"Scaler gagal dimuat: {exc}")
+        scaler = get_scaler()
 
-        print("✅ All models and scaler loaded successfully.")
-        return feat_model, lgbm_model, w2v_model, scaler
+    return feat_model, lgbm_model, w2v_model, scaler
 
-    except Exception as e:
-        print(f"An error occurred while loading models: {e}")
-        return None, None, None, None
 
-def predict_with_lgbm(model, features):
-    """Wrapper untuk LightGBM prediction."""
-    return model.predict_proba(features)
+def _nutrition_to_model_array(nutrition_data: Dict[str, Any]) -> np.ndarray:
+    values = {
+        "Kemasan": nutrition_data.get("kemasan", 0),
+        "Energi": nutrition_data.get("energi", 0),
+        "Lemak": nutrition_data.get("lemak_total", 0),
+        "Karbohidrat": nutrition_data.get("karbohidrat", 0),
+        "Gula": nutrition_data.get("gula", 0),
+        "Protein": nutrition_data.get("protein", 0),
+        "Garam": nutrition_data.get("garam", 0),
+        "Natrium Benzoat": nutrition_data.get("natrium_benzoat", 0),
+    }
 
-def analyze_product_fully(nutrition_data, composition_text, feat_model, lgbm_model, w2v_model, scaler):
-    """
-    Analyzes a product by performing the full hybrid pipeline (Keras + LGBM).
-    [UPGRADE EXPERT]: Menambahkan integrasi Text Mining untuk UPF detection
-    dan rekomendasi yang jauh lebih pintar.
-    """
+    numeric = [hapus_satuan_dan_bersihkan(values[col], column_name=col) for col in NUMERIC_ORDER]
+    return np.array([numeric], dtype=np.float32)
+
+
+def _scale_numeric(numeric_array: np.ndarray, scaler: Any) -> np.ndarray:
+    if scaler is None:
+        return numeric_array.astype(np.float32)
+
     try:
-        # --- 1. PREPARE NUMERICAL INPUT ---
-        numeric_cols_order = ["Kemasan", "Energi", "Lemak", "Karbohidrat", "Gula", "Protein", "Garam", "Natrium Benzoat"]
-        
-        input_numeric_df = pd.DataFrame([{
-            "Kemasan": 0,
-            "Energi": nutrition_data.get('energi', 0),
-            "Lemak": nutrition_data.get('lemak_total', 0),
-            "Karbohidrat": nutrition_data.get('karbohidrat', 0),
-            "Gula": nutrition_data.get('gula', 0),
-            "Protein": nutrition_data.get('protein', 0),
-            "Garam": nutrition_data.get('garam', 0),
-            "Natrium Benzoat": nutrition_data.get('natrium_benzoat', 0)
-        }], columns=numeric_cols_order)
-
-        scaled_numeric_input = scaler.transform(input_numeric_df).astype(np.float32)
-
-        # --- 2. PREPARE TEXT INPUT & UPF DETECTION ---
-        tokens = tokenize_and_clean_text(composition_text)
-        doc_vector = create_document_vector(tokens, w2v_model, target_dim=50)
-        text_input_seq = doc_vector.reshape(1, 50, 1)
-
-        # NLP Rule-Based Scan for Additives
-        is_upf, found_additives = detect_harmful_additives(composition_text)
-
-        # --- 3. FEATURE EXTRACTION ---
-        extracted_features = feat_model.predict([text_input_seq, scaled_numeric_input], verbose=0)
-
-        # --- 4. FINAL PREDICTION ---
-        prediction_proba = predict_with_lgbm(lgbm_model, extracted_features)
-        
-        # Risk Score (0-100)
-        risk_score = (prediction_proba[0][1] * 50) + (prediction_proba[0][2] * 100)
-
-        # --- 5. GENERATE EXPLANATIONS (XAI) AND RECOMMENDATIONS ---
-        # Untuk Hybrid CNN, raw XAI susah ditarik langsung, kita gunakan porsi komposisi
-        # relatif terhadap standar harian (Health Informatics rules) untuk proxy
-        xai_factors = {
-            'Gula (g)': nutrition_data.get('gula', 0),
-            'Natrium (mg)': nutrition_data.get('natrium', 0) or nutrition_data.get('garam', 0) * 1000,
-            'Lemak Total (g)': nutrition_data.get('lemak_total', 0),
-            'Energi Total (kkal)': nutrition_data.get('energi', 0),
-            'Natrium Benzoat (mg)': nutrition_data.get('natrium_benzoat', 0)
-        }
-        sorted_factors = dict(sorted(xai_factors.items(), key=lambda item: item[1], reverse=True))
-
-        # Smart Recommendation Generation based on ML Probabilities AND Text Mining Flags
-        pred_class = np.argmax(prediction_proba[0])
-
-        # Base Recommendation from ML
-        if pred_class == 2: # 'tinggi'
-            recommendation = "🛑 **Risiko TINGGI (ML Prediction):** Sangat tidak disarankan untuk konsumsi harian. "
-        elif pred_class == 1: # 'sedang'
-            recommendation = "⚠️ **Risiko SEDANG (ML Prediction):** Boleh dikonsumsi sesekali, perhatikan porsi sajian Anda. "
-        else: # 'aman'
-            recommendation = "✅ **Risiko RENDAH (ML Prediction):** Relatif aman sebagai bagian dari diet seimbang. "
-
-        # Injecting NLP Domain Knowledge into Recommendation
-        if is_upf:
-            recommendation += f"\n\n🔬 **Insight Teks Komposisi:** Sistem mendeteksi produk ini termasuk **Ultra-Processed Food (UPF)** karena mengandung aditif sintetik: *{', '.join(found_additives)}*. "
-            if pred_class == 0:
-                recommendation += "Meskipun kalorinya mungkin aman, paparan aditif kimia jangka panjang perlu diwaspadai."
-            else:
-                recommendation += "Kombinasi makronutrien buruk dan aditif kimia membuatnya sangat tidak sehat."
-        else:
-            if composition_text.strip() != "" and composition_text.lower() != "tidak terdeteksi.":
-                recommendation += "\n\n🍃 **Insight Teks Komposisi:** Tidak terdeteksi aditif kimia ekstrem. Komposisinya relatif alami/bersih."
-            
-        return risk_score, sorted_factors, recommendation
-
-    except Exception as e:
-        print(f"Error during full analysis: {e}")
-        return 50.0, {}, f"Gagal melakukan analisis penuh: {e}"
+        return scaler.transform(numeric_array).astype(np.float32)
+    except Exception:
+        return numeric_array.astype(np.float32)
 
 
-def analyze_product_fully_debug(nutrition_data, composition_text, feat_model, lgbm_model, w2v_model, scaler):
-    """Debug version of analyze_product_fully"""
+def _predict_probability(lgbm_model: Any, features: np.ndarray) -> float | None:
+    if lgbm_model is None:
+        return None
+
     try:
-        numeric_cols_order = ["Kemasan", "Energi", "Lemak", "Karbohidrat", "Gula", "Protein", "Garam", "Natrium Benzoat"]
-        input_numeric_df = pd.DataFrame([{
-            "Kemasan": 0, "Energi": nutrition_data.get('energi', 0), "Lemak": nutrition_data.get('lemak_total', 0),
-            "Karbohidrat": nutrition_data.get('karbohidrat', 0), "Gula": nutrition_data.get('gula', 0),
-            "Protein": nutrition_data.get('protein', 0), "Garam": nutrition_data.get('garam', 0),
-            "Natrium Benzoat": nutrition_data.get('natrium_benzoat', 0)
-        }], columns=numeric_cols_order)
+        if hasattr(lgbm_model, "predict_proba"):
+            proba = lgbm_model.predict_proba(features)
+            if np.ndim(proba) == 2 and proba.shape[1] > 1:
+                return float(proba[0, 1]) * 100
+            return float(np.ravel(proba)[0]) * 100
 
-        print("\n=== DEBUG: Numerical Input ===")
-        print(input_numeric_df)
-        
-        scaled_numeric_input = scaler.transform(input_numeric_df).astype(np.float32)
-        print("\n=== DEBUG: Scaled Numerical Input ===")
-        print(scaled_numeric_input)
-        
-        tokens = tokenize_and_clean_text(composition_text)
-        print(f"\n=== DEBUG: Tokens ({len(tokens)}) ===")
-        print(tokens[:20])
-        
-        doc_vector = create_document_vector(tokens, w2v_model, target_dim=50)
-        text_input_seq = doc_vector.reshape(1, 50, 1)
+        pred = lgbm_model.predict(features)
+        value = float(np.ravel(pred)[0])
+        return value * 100 if value <= 1 else value
+    except Exception as exc:
+        print(f"Prediksi LightGBM gagal: {exc}")
+        return None
 
-        extracted_features = feat_model.predict([text_input_seq, scaled_numeric_input], verbose=0)
-        print(f"\n=== DEBUG: Extracted Features ===")
-        print(f"First 10 features: {extracted_features[0][:10]}")
-        
-        prediction_proba = predict_with_lgbm(lgbm_model, extracted_features)
-        print(f"\n=== DEBUG: LightGBM Probabilities ===")
-        print(f"P(aman={0}): {prediction_proba[0][0]:.4f} | P(sedang={1}): {prediction_proba[0][1]:.4f} | P(tinggi={2}): {prediction_proba[0][2]:.4f}")
-        
-        risk_score = (prediction_proba[0][1] * 50) + (prediction_proba[0][2] * 100)
-        print(f"Risk Score = {risk_score:.2f}%")
-        
-        return risk_score, prediction_proba[0]
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return None, None
+def _rule_based_risk(nutrition_data: Dict[str, Any], composition_text: str) -> float:
+    energi = float(nutrition_data.get("energi", 0) or 0)
+    gula = float(nutrition_data.get("gula", 0) or 0)
+    natrium = float(nutrition_data.get("natrium", 0) or 0)
+    lemak_total = float(nutrition_data.get("lemak_total", 0) or 0)
+    lemak_jenuh = float(nutrition_data.get("lemak_jenuh", 0) or 0)
+    natrium_benzoat = float(nutrition_data.get("natrium_benzoat", 0) or 0)
+    is_upf, flags = detect_harmful_additives(composition_text)
+
+    score = 0.0
+    score += min(energi / 400 * 20, 20)
+    score += min(gula / 25 * 25, 25)
+    score += min(natrium / 600 * 20, 20)
+    score += min(lemak_total / 20 * 15, 15)
+    score += min(lemak_jenuh / 10 * 15, 15)
+    score += min(natrium_benzoat / 100 * 10, 10)
+
+    if is_upf:
+        score += min(5 + len(flags) * 3, 15)
+
+    return float(max(0, min(score, 100)))
+
+
+def analyze_product_fully(
+    nutrition_data: Dict[str, Any],
+    composition_text: str,
+    feat_model: Any,
+    lgbm_model: Any,
+    w2v_model: Any,
+    scaler: Any,
+) -> Tuple[float, Dict[str, float], str]:
+    """Analisis produk dengan model hybrid jika tersedia, lalu fallback rule based jika model tidak siap."""
+    numeric = _nutrition_to_model_array(nutrition_data)
+    numeric_scaled = _scale_numeric(numeric, scaler)
+
+    tokens = tokenize_and_clean_text(composition_text)
+    text_vec = create_document_vector(tokens, w2v_model, target_dim=50).reshape(1, -1)
+
+    feature_candidates: List[np.ndarray] = []
+
+    if feat_model is not None:
+        try:
+            feature_candidates.append(feat_model.predict([numeric_scaled, text_vec], verbose=0))
+        except Exception:
+            pass
+        try:
+            joined_input = np.concatenate([numeric_scaled, text_vec], axis=1)
+            feature_candidates.append(feat_model.predict(joined_input, verbose=0))
+        except Exception:
+            pass
+
+    feature_candidates.append(np.concatenate([numeric_scaled, text_vec], axis=1))
+    feature_candidates.append(numeric_scaled)
+
+    risk_score = None
+    for candidate in feature_candidates:
+        risk_score = _predict_probability(lgbm_model, np.asarray(candidate))
+        if risk_score is not None:
+            break
+
+    used_fallback = False
+    if risk_score is None:
+        risk_score = _rule_based_risk(nutrition_data, composition_text)
+        used_fallback = True
+
+    risk_score = float(max(0, min(risk_score, 100)))
+
+    xai_factors = {
+        "Energi": float(nutrition_data.get("energi", 0) or 0),
+        "Lemak Total": float(nutrition_data.get("lemak_total", 0) or 0),
+        "Lemak Jenuh": float(nutrition_data.get("lemak_jenuh", 0) or 0),
+        "Protein": float(nutrition_data.get("protein", 0) or 0),
+        "Karbohidrat": float(nutrition_data.get("karbohidrat", 0) or 0),
+        "Gula": float(nutrition_data.get("gula", 0) or 0),
+        "Natrium": float(nutrition_data.get("natrium", 0) or 0),
+        "Natrium Benzoat": float(nutrition_data.get("natrium_benzoat", 0) or 0),
+    }
+
+    is_upf, flags = detect_harmful_additives(composition_text)
+    recommendation = _build_recommendation(risk_score, nutrition_data, flags, used_fallback)
+    return risk_score, xai_factors, recommendation
+
+
+def _build_recommendation(
+    risk_score: float,
+    nutrition_data: Dict[str, Any],
+    upf_flags: List[str],
+    used_fallback: bool = False,
+) -> str:
+    notes: List[str] = []
+
+    if risk_score >= 75:
+        notes.append("Batasi konsumsi. Produk ini masuk kategori risiko sangat tinggi berdasarkan profil gizi yang terbaca.")
+    elif risk_score >= 50:
+        notes.append("Konsumsi sebaiknya dibatasi. Produk ini menunjukkan risiko gizi cukup tinggi.")
+    elif risk_score >= 25:
+        notes.append("Konsumsi masih mungkin dilakukan, tetapi tetap perlu kontrol porsi.")
+    else:
+        notes.append("Produk relatif lebih aman secara gizi, dengan catatan porsi tetap dikendalikan.")
+
+    gula = float(nutrition_data.get("gula", 0) or 0)
+    natrium = float(nutrition_data.get("natrium", 0) or 0)
+    lemak_jenuh = float(nutrition_data.get("lemak_jenuh", 0) or 0)
+
+    if gula >= 10:
+        notes.append("Kandungan gula perlu diperhatikan, terutama untuk pengguna yang menjaga asupan gula harian.")
+    if natrium >= 300:
+        notes.append("Kandungan natrium cukup menonjol, sehingga perlu dibatasi pada pengguna dengan risiko hipertensi.")
+    if lemak_jenuh >= 5:
+        notes.append("Lemak jenuh cukup tinggi dan tidak disarankan dikonsumsi terlalu sering.")
+    if upf_flags:
+        notes.append("Komposisi menunjukkan indikasi bahan ultra proses: " + ", ".join(upf_flags) + ".")
+    if used_fallback:
+        notes.append("Catatan sistem: model prediksi utama belum berhasil digunakan, sehingga aplikasi memakai analisis cadangan berbasis aturan gizi.")
+
+    return " ".join(notes)
