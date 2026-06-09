@@ -1,19 +1,21 @@
 """
 Utility OCR untuk Smart NutriScan AI.
 
-Revisi v4 fokus pada kestabilan saat gambar diupload ke Streamlit Cloud.
-Perubahan utama:
-1. Gambar dibatasi ukurannya agar OCR tidak membebani memori cloud.
-2. OCR tidak memakai rotasi otomatis yang berat.
-3. EasyOCR membaca numpy array, bukan byte stream, agar lebih kompatibel.
-4. Error OCR ditangkap per variasi gambar agar aplikasi tidak langsung crash.
-5. Hasil parsing tetap berbasis baris agar nilai gizi dan komposisi lebih logis.
+Revisi v5 fokus pada akurasi logis hasil OCR.
+Masalah yang diperbaiki:
+1. Hasil dari beberapa variasi preprocessing tidak lagi digabung mentah karena bisa menduplikasi teks.
+2. Parsing nilai gizi memakai kandidat per variasi gambar, lalu memilih nilai yang paling masuk akal.
+3. Persentase AKG tidak lagi ikut terbaca sebagai nilai gram atau mg.
+4. Nilai tidak wajar seperti 259 g untuk lemak jenuh diperbaiki dengan aturan desimal yang ketat.
+5. Takaran saji ikut dibaca dari label.
+6. Komposisi dibaca dari satu variasi terbaik agar tidak berulang dua sampai tiga kali.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Tuple
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -21,6 +23,7 @@ from PIL import Image, ImageOps
 
 
 NUTRITION_DEFAULTS: Dict[str, Any] = {
+    "takaran_saji": 100.0,
     "energi": 0.0,
     "lemak_total": 0.0,
     "lemak_jenuh": 0.0,
@@ -34,9 +37,22 @@ NUTRITION_DEFAULTS: Dict[str, Any] = {
     "product_name": "Produk Tanpa Nama",
 }
 
+NUTRITION_FIELD_LIMITS: Dict[str, Tuple[float, float]] = {
+    "takaran_saji": (1.0, 1000.0),
+    "energi": (0.0, 1000.0),
+    "lemak_total": (0.0, 80.0),
+    "lemak_jenuh": (0.0, 40.0),
+    "protein": (0.0, 80.0),
+    "karbohidrat": (0.0, 150.0),
+    "gula": (0.0, 120.0),
+    "garam": (0.0, 20.0),
+    "natrium": (0.0, 5000.0),
+    "natrium_benzoat": (0.0, 2000.0),
+}
 
-def normalize_pil_image(pil_image: Image.Image, max_side: int = 1600) -> Image.Image:
-    """Membuat gambar aman untuk OCR dan Streamlit Cloud."""
+
+def normalize_pil_image(pil_image: Image.Image, max_side: int = 1700) -> Image.Image:
+    """Membuat gambar aman untuk OCR dan menjaga orientasi EXIF."""
     image = ImageOps.exif_transpose(pil_image).convert("RGB")
     width, height = image.size
     longest = max(width, height)
@@ -50,14 +66,13 @@ def normalize_pil_image(pil_image: Image.Image, max_side: int = 1600) -> Image.I
 
 
 def preprocess_image_variants_for_ocr(pil_image: Image.Image) -> Dict[str, Image.Image]:
-    """Menghasilkan variasi gambar ringan agar OCR tidak bergantung pada satu metode preprocessing."""
+    """Menghasilkan variasi gambar. Tidak semua variasi akan dipakai sebagai sumber akhir."""
     safe_image = normalize_pil_image(pil_image)
     img = np.array(safe_image)
 
-    # Perbesar secukupnya. Jangan terlalu besar agar tidak boros memori cloud.
     h, w = img.shape[:2]
-    if max(h, w) < 1200:
-        img = cv2.resize(img, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+    if max(h, w) < 1300:
+        img = cv2.resize(img, None, fx=1.6, fy=1.6, interpolation=cv2.INTER_CUBIC)
 
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
@@ -79,7 +94,6 @@ def preprocess_image_variants_for_ocr(pil_image: Image.Image) -> Dict[str, Image
     ])
     sharpened = cv2.filter2D(denoised, -1, sharpen_kernel)
 
-    # Binary kadang bagus, kadang merusak teks kecil. Tetap disiapkan sebagai variasi ringan.
     binary = cv2.adaptiveThreshold(
         denoised,
         255,
@@ -89,6 +103,7 @@ def preprocess_image_variants_for_ocr(pil_image: Image.Image) -> Dict[str, Image
         11,
     )
 
+    # Urutan sengaja dibuat dari yang paling natural ke yang paling agresif.
     return {
         "original_resized": Image.fromarray(img),
         "gray_enhanced": Image.fromarray(denoised),
@@ -105,103 +120,8 @@ def _bbox_left_x(item: Dict[str, Any]) -> float:
     return float(min(point[0] for point in item["bbox"]))
 
 
-def deduplicate_ocr_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Menghapus teks duplikat dari beberapa hasil preprocessing, memilih confidence tertinggi."""
-    unique: Dict[str, Dict[str, Any]] = {}
-
-    for item in results:
-        key = re.sub(r"\s+", " ", item["text"].lower().strip())
-        if not key:
-            continue
-
-        if key not in unique or item["conf"] > unique[key]["conf"]:
-            unique[key] = item
-
-    return list(unique.values())
-
-
-def _reader_readtext_safely(reader: Any, image_variant: Image.Image) -> Tuple[List[Any], str]:
-    """Menjalankan EasyOCR dengan parameter aman dan fallback jika versi EasyOCR berbeda."""
-    image_array = np.array(image_variant)
-
-    try:
-        results = reader.readtext(
-            image_array,
-            detail=1,
-            paragraph=False,
-            decoder="greedy",
-            contrast_ths=0.1,
-            adjust_contrast=0.6,
-            text_threshold=0.5,
-            low_text=0.3,
-            link_threshold=0.4,
-            mag_ratio=1.0,
-        )
-        return results, ""
-    except TypeError as exc:
-        # Fallback untuk EasyOCR yang tidak menerima salah satu parameter tambahan.
-        try:
-            results = reader.readtext(image_array, detail=1, paragraph=False)
-            return results, ""
-        except Exception as inner_exc:
-            return [], f"EasyOCR fallback gagal: {inner_exc}"
-    except Exception as exc:
-        return [], f"EasyOCR gagal membaca gambar: {exc}"
-
-
-def run_ocr_multi_variant(
-    reader: Any,
-    pil_image: Image.Image,
-    min_confidence: float = 0.20,
-    max_variants: int = 3,
-) -> Dict[str, Any]:
-    """Menjalankan EasyOCR pada beberapa variasi gambar tanpa membuat aplikasi crash."""
-    variants = preprocess_image_variants_for_ocr(pil_image)
-    selected_variants = dict(list(variants.items())[:max_variants])
-
-    all_results: List[Dict[str, Any]] = []
-    errors: List[str] = []
-
-    for variant_name, image_variant in selected_variants.items():
-        results, error_message = _reader_readtext_safely(reader, image_variant)
-        if error_message:
-            errors.append(f"{variant_name}: {error_message}")
-            continue
-
-        for result in results:
-            try:
-                bbox, text, conf = result
-            except Exception:
-                continue
-
-            clean_text = str(text).strip()
-            try:
-                confidence = float(conf)
-            except Exception:
-                confidence = 0.0
-
-            if clean_text and confidence >= min_confidence:
-                all_results.append({
-                    "variant": variant_name,
-                    "bbox": bbox,
-                    "text": clean_text,
-                    "conf": confidence,
-                })
-
-    deduped = deduplicate_ocr_results(all_results)
-    lines = group_ocr_results_into_lines(deduped)
-
-    return {
-        "items": deduped,
-        "lines": lines,
-        "raw_text": "\n".join(lines),
-        "variants": selected_variants,
-        "errors": errors,
-    }
-
-
 def group_ocr_results_into_lines(ocr_items: List[Dict[str, Any]], y_tolerance: int = 18) -> List[str]:
-    """Menyusun ulang hasil OCR menjadi baris berdasarkan posisi vertikal dan horizontal."""
+    """Menyusun hasil OCR per variasi menjadi baris, tidak lintas variasi."""
     if not ocr_items:
         return []
 
@@ -233,27 +153,71 @@ def group_ocr_results_into_lines(ocr_items: List[Dict[str, Any]], y_tolerance: i
     return text_lines
 
 
+def _reader_readtext_safely(reader: Any, image_variant: Image.Image) -> Tuple[List[Any], str]:
+    """Menjalankan EasyOCR dengan parameter aman dan fallback."""
+    image_array = np.array(image_variant)
+
+    try:
+        results = reader.readtext(
+            image_array,
+            detail=1,
+            paragraph=False,
+            decoder="beamsearch",
+            beamWidth=3,
+            contrast_ths=0.08,
+            adjust_contrast=0.7,
+            text_threshold=0.45,
+            low_text=0.25,
+            link_threshold=0.35,
+            mag_ratio=1.1,
+        )
+        return results, ""
+    except TypeError:
+        try:
+            results = reader.readtext(image_array, detail=1, paragraph=False)
+            return results, ""
+        except Exception as inner_exc:
+            return [], f"EasyOCR fallback gagal: {inner_exc}"
+    except Exception as exc:
+        return [], f"EasyOCR gagal membaca gambar: {exc}"
+
+
 def normalize_ocr_text(text: str) -> str:
     """Normalisasi kata OCR umum pada label Indonesia dan Inggris."""
     text = str(text).lower().strip()
+    text = text.replace("\n", " ")
     text = text.replace(",", ".")
+    text = re.sub(r"[|]", " ", text)
+
+    # Koreksi karakter OCR yang sering keliru pada angka dan satuan.
+    text = re.sub(r"\b[oO]\s*(g|mg|kkal|kal)\b", r"0 \1", text)
+    text = re.sub(r"(?<=\d)[oO](?=\d|\s*(?:g|mg|kkal|kal)\b)", "0", text)
+    text = re.sub(r"(?<=\d)l(?=\d)", "1", text)
 
     replacements = {
+        "nutrition information": "informasi nilai gizi",
         "nutrition facts": "informasi nilai gizi",
         "nutrition fact": "informasi nilai gizi",
-        "energy": "energi",
+        "serving size": "takaran saji",
+        "serving amount": "jumlah per sajian",
+        "amount per serving": "jumlah per sajian",
+        "energy total": "energi total",
+        "total calories": "energi total",
         "calories": "energi",
         "calorie": "energi",
+        "energy from fat": "energi dari lemak",
         "kalori": "energi",
-        "energi total": "energi",
-        "jumlah energi": "energi",
         "total fat": "lemak total",
         "lemak tota1": "lemak total",
         "lemak totai": "lemak total",
         "saturated fat": "lemak jenuh",
-        "total carbohydrate": "karbohidrat",
+        "lemak jenu h": "lemak jenuh",
+        "lemak jen uh": "lemak jenuh",
+        "protein/protein": "protein",
+        "total carbohydrate": "karbohidrat total",
         "carbohydrate": "karbohidrat",
-        "karbohidrat total": "karbohidrat",
+        "karbohidrat tota1": "karbohidrat total",
+        "karbohidrat totai": "karbohidrat total",
         "sugars": "gula",
         "sugar": "gula",
         "sodium": "natrium",
@@ -262,19 +226,120 @@ def normalize_ocr_text(text: str) -> str:
         "ingredient": "komposisi",
         "bahan bahan": "komposisi",
         "bahan-bahan": "komposisi",
+        "ingredienta": "ingredienta",
     }
 
     for old, new in replacements.items():
         text = text.replace(old, new)
 
     text = re.sub(r"(?<=\d)(kkal|kal|mg|g)\b", r" \1", text)
+    text = re.sub(r"(?<=\d)\s*%", " %", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
+def _variant_score(lines: List[str], items: List[Dict[str, Any]], mode: str) -> float:
+    raw = " ".join(lines)
+    clean = normalize_ocr_text(raw)
+    if not clean:
+        return 0.0
+
+    nutrition_words = [
+        "takaran saji",
+        "energi",
+        "lemak total",
+        "lemak jenuh",
+        "protein",
+        "karbohidrat",
+        "gula",
+        "natrium",
+        "garam",
+    ]
+    composition_words = ["komposisi", "pati", "minyak", "pengawet", "gula", "garam", "bumbu"]
+    words = composition_words if mode == "composition" else nutrition_words
+    keyword_score = sum(1 for word in words if word in clean)
+    digit_score = min(len(re.findall(r"\d", clean)) / 20.0, 4.0)
+    text_score = min(len(clean) / 250.0, 5.0)
+    conf_score = 0.0
+    if items:
+        conf_score = sum(float(item.get("conf", 0.0)) for item in items) / max(1, len(items))
+    return keyword_score * 3.0 + digit_score + text_score + conf_score
+
+
+def run_ocr_multi_variant(
+    reader: Any,
+    pil_image: Image.Image,
+    min_confidence: float = 0.16,
+    max_variants: int = 4,
+    mode: str = "nutrition",
+) -> Dict[str, Any]:
+    """Menjalankan EasyOCR per variasi dan memilih variasi terbaik sebagai raw OCR utama."""
+    variants = preprocess_image_variants_for_ocr(pil_image)
+    selected_variants = dict(list(variants.items())[:max_variants])
+
+    variant_payloads: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    for variant_name, image_variant in selected_variants.items():
+        results, error_message = _reader_readtext_safely(reader, image_variant)
+        if error_message:
+            errors.append(f"{variant_name}: {error_message}")
+            continue
+
+        variant_items: List[Dict[str, Any]] = []
+        for result in results:
+            try:
+                bbox, text, conf = result
+            except Exception:
+                continue
+
+            clean_text = str(text).strip()
+            try:
+                confidence = float(conf)
+            except Exception:
+                confidence = 0.0
+
+            if clean_text and confidence >= min_confidence:
+                variant_items.append({
+                    "variant": variant_name,
+                    "bbox": bbox,
+                    "text": clean_text,
+                    "conf": confidence,
+                })
+
+        lines = group_ocr_results_into_lines(variant_items)
+        score = _variant_score(lines, variant_items, mode=mode)
+        variant_payloads.append({
+            "name": variant_name,
+            "items": variant_items,
+            "lines": lines,
+            "score": score,
+        })
+
+    if variant_payloads:
+        best_payload = max(variant_payloads, key=lambda payload: payload["score"])
+    else:
+        best_payload = {"name": "none", "items": [], "lines": [], "score": 0.0}
+
+    all_items: List[Dict[str, Any]] = []
+    for payload in variant_payloads:
+        all_items.extend(payload.get("items", []))
+
+    return {
+        "items": all_items,
+        "lines": best_payload.get("lines", []),
+        "raw_text": "\n".join(best_payload.get("lines", [])),
+        "best_variant": best_payload.get("name", "none"),
+        "variant_payloads": variant_payloads,
+        "variants": selected_variants,
+        "errors": errors,
+    }
+
+
 def _extract_numbers_with_units(line: str) -> List[Tuple[float, str]]:
     clean_line = normalize_ocr_text(line)
-    matches = re.findall(r"(\d+(?:\.\d+)?)\s*(kkal|kal|mg|g)?", clean_line)
+    pattern = r"(\d+(?:\.\d+)?)\s*(kkal|kal|mg|g|%)?"
+    matches = re.findall(pattern, clean_line)
     values: List[Tuple[float, str]] = []
 
     for number, unit in matches:
@@ -286,134 +351,381 @@ def _extract_numbers_with_units(line: str) -> List[Tuple[float, str]]:
     return values
 
 
-def extract_number_from_line(line: str, preferred_units: Tuple[str, ...] | None = None) -> float:
-    """Mengambil angka paling logis dari satu baris label."""
-    values = _extract_numbers_with_units(line)
-    if not values:
-        return 0.0
+def _numbers_after_marker(line: str, markers: Tuple[str, ...]) -> List[Tuple[float, str]]:
+    clean = normalize_ocr_text(line)
+    best_pos: Optional[int] = None
 
-    if preferred_units:
+    for marker in markers:
+        idx = clean.find(marker)
+        if idx >= 0:
+            pos = idx + len(marker)
+            if best_pos is None or pos < best_pos:
+                best_pos = pos
+
+    if best_pos is not None:
+        clean = clean[best_pos:]
+
+    return _extract_numbers_with_units(clean)
+
+
+def _choose_number(
+    line: str,
+    markers: Tuple[str, ...],
+    preferred_units: Tuple[str, ...],
+    allow_unitless: bool = False,
+) -> Optional[float]:
+    values = _numbers_after_marker(line, markers)
+    if not values:
+        return None
+
+    # Utamakan angka dengan satuan yang benar, bukan angka persen AKG.
+    for value, unit in values:
+        if unit in preferred_units:
+            return float(value)
+
+    if allow_unitless:
         for value, unit in values:
-            if unit in preferred_units:
+            if unit != "%":
                 return float(value)
 
-    return float(values[0][0])
+    return None
 
 
-def parse_nutrition_from_lines(lines: List[str]) -> Dict[str, Any]:
-    """Mengekstrak nilai gizi dari baris teks OCR."""
+def _repair_value_by_field(field: str, value: float, line: str) -> Optional[float]:
+    """Mencegah angka OCR tidak masuk akal langsung masuk ke form."""
+    if value is None:
+        return None
+
+    value = float(value)
+    clean = normalize_ocr_text(line)
+
+    # Perbaikan spesifik OCR label gizi. Banyak label kecil membuat 2.5 g terbaca 25 g atau 259.
+    if field == "lemak_jenuh":
+        if value > 100:
+            value = value / 100.0
+        elif value > 20:
+            value = value / 10.0
+
+    elif field == "lemak_total":
+        if value > 100:
+            value = value / 100.0
+        elif value > 50 and "lemak total" in clean:
+            value = value / 10.0
+
+    elif field == "karbohidrat":
+        if value > 300:
+            value = value / 100.0
+        elif value > 100:
+            value = value / 10.0
+
+    elif field == "gula":
+        if value > 200:
+            value = value / 100.0
+        elif value > 100:
+            value = value / 10.0
+
+    elif field == "protein":
+        if value > 100:
+            value = value / 100.0
+        elif value > 80:
+            value = value / 10.0
+
+    elif field == "garam":
+        # Garam label Indonesia sering ditulis sebagai natrium mg. Jangan simpan mg sebagai gram.
+        if "mg" in clean and ("natrium" in clean or "sodium" in clean):
+            return None
+        if value > 50:
+            value = value / 1000.0
+        elif value > 20:
+            value = value / 10.0
+
+    low, high = NUTRITION_FIELD_LIMITS.get(field, (0.0, float("inf")))
+    if value < low or value > high:
+        return None
+
+    return round(float(value), 2)
+
+
+def _candidate_from_line(field: str, line: str) -> Optional[float]:
+    clean = normalize_ocr_text(line)
+
+    if field == "takaran_saji":
+        if "takaran saji" not in clean:
+            return None
+        value = _choose_number(clean, ("takaran saji",), ("g", "ml"), allow_unitless=True)
+        return _repair_value_by_field(field, value, clean) if value is not None else None
+
+    if field == "energi":
+        if "energi" not in clean:
+            return None
+        if "energi dari lemak" in clean or "from fat" in clean:
+            return None
+        value = _choose_number(clean, ("energi total", "energi"), ("kkal", "kal"), allow_unitless=True)
+        return _repair_value_by_field(field, value, clean) if value is not None else None
+
+    if field == "lemak_jenuh":
+        if "lemak jenuh" not in clean:
+            return None
+        value = _choose_number(clean, ("lemak jenuh",), ("g",), allow_unitless=True)
+        return _repair_value_by_field(field, value, clean) if value is not None else None
+
+    if field == "lemak_total":
+        if "lemak total" not in clean:
+            return None
+        value = _choose_number(clean, ("lemak total",), ("g",), allow_unitless=True)
+        return _repair_value_by_field(field, value, clean) if value is not None else None
+
+    if field == "protein":
+        if "protein" not in clean:
+            return None
+        value = _choose_number(clean, ("protein",), ("g",), allow_unitless=True)
+        return _repair_value_by_field(field, value, clean) if value is not None else None
+
+    if field == "karbohidrat":
+        if "karbohidrat" not in clean:
+            return None
+        value = _choose_number(clean, ("karbohidrat total", "karbohidrat"), ("g",), allow_unitless=True)
+        return _repair_value_by_field(field, value, clean) if value is not None else None
+
+    if field == "gula":
+        if "gula" not in clean:
+            return None
+        value = _choose_number(clean, ("gula",), ("g",), allow_unitless=True)
+        return _repair_value_by_field(field, value, clean) if value is not None else None
+
+    if field == "natrium_benzoat":
+        if "benzoat" not in clean:
+            return None
+        value = _choose_number(clean, ("natrium benzoat", "benzoat"), ("mg", "g"), allow_unitless=True)
+        return _repair_value_by_field(field, value, clean) if value is not None else None
+
+    if field == "natrium":
+        if "natrium" not in clean and "sodium" not in clean:
+            return None
+        value = _choose_number(clean, ("natrium", "sodium", "garam"), ("mg",), allow_unitless=False)
+        return _repair_value_by_field(field, value, clean) if value is not None else None
+
+    if field == "garam":
+        if "garam" not in clean:
+            return None
+        value = _choose_number(clean, ("garam",), ("g",), allow_unitless=False)
+        return _repair_value_by_field(field, value, clean) if value is not None else None
+
+    return None
+
+
+def _choose_best_candidate(candidates: List[Dict[str, Any]]) -> Optional[float]:
+    if not candidates:
+        return None
+
+    grouped: Dict[float, List[Dict[str, Any]]] = defaultdict(list)
+    for cand in candidates:
+        grouped[round(float(cand["value"]), 2)].append(cand)
+
+    ranked: List[Tuple[int, int, float, float]] = []
+    for value, items in grouped.items():
+        count = len(items)
+        best_variant_rank = min(int(item.get("variant_rank", 99)) for item in items)
+        keyword_score = max(float(item.get("keyword_score", 0.0)) for item in items)
+        ranked.append((count, -best_variant_rank, keyword_score, value))
+
+    ranked.sort(reverse=True)
+    return ranked[0][3]
+
+
+def parse_nutrition_from_variants(variant_payloads: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[str]]:
+    """Parsing nilai gizi dari beberapa variasi OCR dengan guard logis."""
     data = dict(NUTRITION_DEFAULTS)
+    warnings: List[str] = []
+    field_candidates: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
-    for line in lines:
-        clean_line = normalize_ocr_text(line)
-        if not clean_line:
-            continue
-
-        if "energi" in clean_line:
-            data["energi"] = extract_number_from_line(clean_line, preferred_units=("kkal", "kal"))
-        elif "lemak jenuh" in clean_line:
-            data["lemak_jenuh"] = extract_number_from_line(clean_line, preferred_units=("g",))
-        elif "lemak total" in clean_line or clean_line.startswith("lemak"):
-            data["lemak_total"] = extract_number_from_line(clean_line, preferred_units=("g",))
-        elif "protein" in clean_line:
-            data["protein"] = extract_number_from_line(clean_line, preferred_units=("g",))
-        elif "karbohidrat" in clean_line:
-            data["karbohidrat"] = extract_number_from_line(clean_line, preferred_units=("g",))
-        elif "gula" in clean_line:
-            data["gula"] = extract_number_from_line(clean_line, preferred_units=("g",))
-        elif "natrium benzoat" in clean_line or "benzoat" in clean_line:
-            data["natrium_benzoat"] = extract_number_from_line(clean_line, preferred_units=("mg", "g"))
-        elif "natrium" in clean_line:
-            data["natrium"] = extract_number_from_line(clean_line, preferred_units=("mg",))
-        elif "garam" in clean_line:
-            data["garam"] = extract_number_from_line(clean_line, preferred_units=("g", "mg"))
-
-    if data["garam"] > 0 and data["natrium"] == 0:
-        data["natrium"] = data["garam"] * 400
-
-    product_name = infer_product_name(lines)
-    if product_name:
-        data["product_name"] = product_name
-
-    return data
-
-
-def infer_product_name(lines: List[str]) -> str:
-    """Mengambil kandidat nama produk dari baris awal, tanpa memaksa jika yang terbaca adalah label gizi."""
-    blocked = [
-        "informasi nilai gizi",
-        "nutrition facts",
-        "komposisi",
+    fields = [
+        "takaran_saji",
         "energi",
-        "lemak",
+        "lemak_total",
+        "lemak_jenuh",
         "protein",
         "karbohidrat",
         "gula",
+        "garam",
         "natrium",
-        "takaran",
+        "natrium_benzoat",
     ]
 
-    for line in lines[:5]:
-        clean = normalize_ocr_text(line)
-        if len(clean) < 3:
-            continue
-        if any(word in clean for word in blocked):
-            continue
-        if re.search(r"\d", clean):
-            continue
-        return str(line).strip().title()
+    ranked_payloads = sorted(variant_payloads, key=lambda payload: payload.get("score", 0), reverse=True)
 
-    return "Produk Tanpa Nama"
+    for variant_rank, payload in enumerate(ranked_payloads):
+        for line in payload.get("lines", []):
+            clean = normalize_ocr_text(line)
+            for field in fields:
+                value = _candidate_from_line(field, clean)
+                if value is None:
+                    continue
+                keyword_score = 1.0
+                if field.replace("_", " ") in clean:
+                    keyword_score += 1.0
+                field_candidates[field].append({
+                    "value": value,
+                    "line": line,
+                    "variant": payload.get("name", "unknown"),
+                    "variant_rank": variant_rank,
+                    "keyword_score": keyword_score,
+                })
+
+    for field in fields:
+        chosen = _choose_best_candidate(field_candidates.get(field, []))
+        if chosen is not None:
+            data[field] = chosen
+        elif field != "natrium_benzoat":
+            warnings.append(f"{field}: tidak terbaca dengan cukup yakin")
+
+    # Jika label memakai Garam sebagai gram dan natrium kosong, konversi konservatif ke natrium.
+    if data.get("garam", 0) > 0 and data.get("natrium", 0) == 0:
+        data["natrium"] = round(float(data["garam"]) * 400.0, 2)
+
+    data["product_name"] = "Produk Tanpa Nama"
+    return data, warnings
+
+
+def parse_nutrition_from_lines(lines: List[str]) -> Dict[str, Any]:
+    """Kompatibilitas untuk pemanggilan lama."""
+    payload = {"name": "single", "lines": lines, "score": 1.0}
+    data, _ = parse_nutrition_from_variants([payload])
+    return data
+
+
+def _line_has_composition_marker(line: str) -> bool:
+    clean = normalize_ocr_text(line)
+    return any(marker in clean for marker in ["komposisi", "bahan"])
+
+
+def select_best_composition_lines(variant_payloads: List[Dict[str, Any]]) -> List[str]:
+    """Memilih satu variasi terbaik agar komposisi tidak dobel dari hasil multi preprocessing."""
+    if not variant_payloads:
+        return []
+
+    def score(payload: Dict[str, Any]) -> float:
+        raw = " ".join(payload.get("lines", []))
+        clean = normalize_ocr_text(raw)
+        marker_score = 10 if ("komposisi" in clean or "bahan" in clean) else 0
+        additive_score = sum(1 for word in ["pengawet", "gula", "garam", "minyak", "pati", "bumbu", "pewarna"] if word in clean)
+        length_score = min(len(clean) / 120.0, 8.0)
+        return marker_score + additive_score + length_score
+
+    best = max(variant_payloads, key=score)
+    return best.get("lines", [])
+
+
+def _dedupe_composition_segments(text: str) -> str:
+    separators = re.split(r"([,;])", text)
+    cleaned_parts: List[str] = []
+    seen = set()
+
+    current = ""
+    for token in separators:
+        if token in [",", ";"]:
+            segment = current.strip()
+            segment_key = re.sub(r"[^a-z0-9]+", "", normalize_ocr_text(segment))[:80]
+            if segment and segment_key and segment_key not in seen:
+                cleaned_parts.append(segment)
+                seen.add(segment_key)
+            current = ""
+        else:
+            current += token
+
+    tail = current.strip()
+    tail_key = re.sub(r"[^a-z0-9]+", "", normalize_ocr_text(tail))[:80]
+    if tail and tail_key and tail_key not in seen:
+        cleaned_parts.append(tail)
+
+    if not cleaned_parts:
+        return text
+
+    return ", ".join(cleaned_parts)
+
 
 
 def parse_composition_from_lines(lines: List[str]) -> str:
-    """Mengekstrak komposisi dari hasil OCR."""
+    """Mengekstrak komposisi dari satu variasi OCR terbaik tanpa menggandakan hasil antar variasi."""
     raw_text = " ".join(lines).strip()
     if not raw_text:
         return "Tidak terdeteksi."
 
-    normalized = normalize_ocr_text(raw_text)
-    match = re.search(r"(?:komposisi|bahan)\s*:?\s*(.*)", normalized, flags=re.IGNORECASE)
-    composition = match.group(1) if match else normalized
+    raw_text = re.sub(r"\s+", " ", raw_text).strip()
+    lower_text = raw_text.lower()
 
+    # Cari marker pada teks asli agar tanda koma komposisi tidak berubah menjadi titik.
+    marker_match = re.search(r"(?:komposisi|bahan(?:\s*bahan)?|ingredients?)\s*:?", lower_text)
+    if marker_match:
+        composition = raw_text[marker_match.end():]
+    else:
+        composition = raw_text
+
+    # Hentikan sebelum bagian Inggris atau metadata kemasan agar komposisi tidak dobel.
     stop_patterns = [
+        "ingredienta",
+        "ingredients",
+        "ingredient",
         "informasi nilai gizi",
+        "nutrition information",
         "nutrition facts",
-        "mengandung alergen",
+        "nutrition fact",
+        "imported",
+        "distributed",
         "diproduksi",
+        "diedarkan",
         "baik digunakan",
         "expired",
         "exp",
         "tanggal",
         "berat bersih",
+        "net weight",
+        "netto",
+        "barcode",
     ]
 
+    lower_composition = composition.lower()
+    cut_index = len(composition)
     for stop_word in stop_patterns:
-        composition = re.split(stop_word, composition, flags=re.IGNORECASE)[0]
+        idx = lower_composition.find(stop_word)
+        if idx >= 0:
+            cut_index = min(cut_index, idx)
 
+    composition = composition[:cut_index]
     composition = re.sub(r"\s+", " ", composition).strip(" .,:;")
+    composition = _dedupe_composition_segments(composition)
+    composition = re.sub(r"\s+", " ", composition).strip(" .,:;")
+
     if len(composition) < 5:
         return "Tidak terdeteksi."
 
-    return composition.capitalize()
-
+    return composition[:1].upper() + composition[1:]
 
 def parse_scan_result(reader: Any, pil_image: Image.Image, mode: str = "nutrition") -> Dict[str, Any]:
     """Fungsi praktis untuk dipakai di app.py."""
-    ocr_payload = run_ocr_multi_variant(reader, pil_image)
-    lines = ocr_payload["lines"]
+    ocr_payload = run_ocr_multi_variant(reader, pil_image, mode=mode)
+    variant_payloads = ocr_payload.get("variant_payloads", [])
 
     if mode == "composition":
+        selected_lines = select_best_composition_lines(variant_payloads)
         parsed = dict(NUTRITION_DEFAULTS)
-        parsed["komposisi"] = parse_composition_from_lines(lines)
+        parsed["komposisi"] = parse_composition_from_lines(selected_lines)
+        quality_warnings: List[str] = []
+        if parsed["komposisi"] == "Tidak terdeteksi.":
+            quality_warnings.append("Komposisi belum terbaca jelas. Coba crop hanya area komposisi atau input manual.")
+        raw_text = "\n".join(selected_lines)
     else:
-        parsed = parse_nutrition_from_lines(lines)
+        parsed, quality_warnings = parse_nutrition_from_variants(variant_payloads)
+        raw_text = ocr_payload.get("raw_text", "")
 
     return {
         "parsed": parsed,
-        "lines": lines,
-        "raw_text": ocr_payload["raw_text"],
-        "items": ocr_payload["items"],
-        "variants": ocr_payload["variants"],
+        "lines": raw_text.splitlines() if raw_text else [],
+        "raw_text": raw_text,
+        "items": ocr_payload.get("items", []),
+        "variants": ocr_payload.get("variants", {}),
+        "best_variant": ocr_payload.get("best_variant", "none"),
+        "variant_payloads": variant_payloads,
         "errors": ocr_payload.get("errors", []),
+        "quality_warnings": quality_warnings,
     }

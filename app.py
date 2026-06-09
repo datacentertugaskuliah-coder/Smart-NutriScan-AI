@@ -66,17 +66,52 @@ def run_ocr_safely(reader, image, mode):
         return None, str(exc)
 
 
+OCR_WIDGET_KEY_MAP = {
+    "takaran_saji": "ocr_saji",
+    "energi": "ocr_energi",
+    "lemak_total": "ocr_lemak",
+    "lemak_jenuh": "ocr_jenuh",
+    "protein": "ocr_protein",
+    "karbohidrat": "ocr_karbo",
+    "gula": "ocr_gula",
+    "garam": "ocr_garam",
+    "natrium": "ocr_natrium",
+    "natrium_benzoat": "ocr_benzoat",
+    "komposisi": "ocr_komposisi",
+    "product_name": "ocr_name",
+}
+
+
+def sync_ocr_value_to_form(key, value):
+    """Menyinkronkan hasil OCR ke data dict dan widget form konfirmasi."""
+    if key not in st.session_state.ocr_data:
+        return
+
+    st.session_state.ocr_data[key] = value
+    widget_key = OCR_WIDGET_KEY_MAP.get(key)
+    if widget_key:
+        st.session_state[widget_key] = value
+
+
 def render_ocr_result_debug(scan_result, label):
     if not scan_result:
         return
 
     errors = scan_result.get("errors", [])
+    quality_warnings = scan_result.get("quality_warnings", [])
+
+    if quality_warnings:
+        with st.expander(f"Catatan kualitas OCR {label}", expanded=False):
+            for item in quality_warnings:
+                st.warning(item)
+
     if errors:
-        with st.expander(f"Catatan OCR {label}", expanded=False):
+        with st.expander(f"Catatan error OCR {label}", expanded=False):
             for item in errors:
                 st.warning(item)
 
     with st.expander(f"Lihat teks OCR {label}", expanded=False):
+        st.caption(f"Variasi gambar terbaik: {scan_result.get('best_variant', 'tidak diketahui')}")
         st.text(scan_result.get("raw_text") or "Tidak ada teks terbaca")
 
     with st.expander(f"Lihat variasi preprocessing {label}", expanded=False):
@@ -100,6 +135,7 @@ NUTRITION_KEYS = [
 EXAMPLE_PRESETS = {
     "Kosong": {
         "product_name": "",
+        "takaran_saji": 100.0,
         "energi": 0.0,
         "lemak_total": 0.0,
         "lemak_jenuh": 0.0,
@@ -113,6 +149,7 @@ EXAMPLE_PRESETS = {
     },
     "Contoh Aman": {
         "product_name": "Contoh Produk Aman",
+        "takaran_saji": 100.0,
         "energi": 180.0,
         "lemak_total": 5.0,
         "lemak_jenuh": 1.5,
@@ -126,6 +163,7 @@ EXAMPLE_PRESETS = {
     },
     "Contoh Sedang": {
         "product_name": "Contoh Produk Sedang",
+        "takaran_saji": 100.0,
         "energi": 320.0,
         "lemak_total": 15.0,
         "lemak_jenuh": 6.0,
@@ -139,6 +177,7 @@ EXAMPLE_PRESETS = {
     },
     "Contoh Tinggi": {
         "product_name": "Contoh Produk Tinggi",
+        "takaran_saji": 100.0,
         "energi": 550.0,
         "lemak_total": 30.0,
         "lemak_jenuh": 14.0,
@@ -338,7 +377,7 @@ def input_form(prefix, defaults):
     product_name = st.text_input("Nama Produk", value=defaults.get("product_name", ""), key=f"{prefix}_name")
 
     c0, c1, c2 = st.columns(3)
-    takaran_saji = c0.number_input("Takaran Saji g atau ml", min_value=1.0, value=100.0, format="%.2f", key=f"{prefix}_saji")
+    takaran_saji = c0.number_input("Takaran Saji g atau ml", min_value=1.0, value=float(defaults.get("takaran_saji", 100.0)), format="%.2f", key=f"{prefix}_saji")
     energi = c1.number_input("Energi kkal", min_value=0.0, value=float(defaults.get("energi", 0)), format="%.2f", key=f"{prefix}_energi")
     lemak_total = c2.number_input("Lemak Total g", min_value=0.0, value=float(defaults.get("lemak_total", 0)), format="%.2f", key=f"{prefix}_lemak")
 
@@ -472,9 +511,9 @@ elif app_mode == "Scan from Image":
                         for key, value in parsed_gizi.items():
                             if key in st.session_state.ocr_data:
                                 if value not in [0, 0.0, "Tidak terdeteksi.", "Produk Tanpa Nama", ""]:
-                                    st.session_state.ocr_data[key] = value
+                                    sync_ocr_value_to_form(key, value)
 
-                        st.success("Nilai gizi berhasil diproses. Periksa lagi hasilnya di form konfirmasi.")
+                        st.success("Nilai gizi berhasil diproses. Hanya angka yang lolos guard logis yang dimasukkan ke form. Periksa lagi sebelum analisis.")
                         render_ocr_result_debug(scan_result_1, "nilai gizi")
             except Exception as exc:
                 st.error("Gambar nilai gizi tidak bisa dibaca. Coba upload ulang dalam format JPG atau PNG.")
@@ -502,9 +541,9 @@ elif app_mode == "Scan from Image":
                     else:
                         parsed_komposisi = scan_result_2["parsed"].get("komposisi", "Tidak terdeteksi.")
                         if parsed_komposisi != "Tidak terdeteksi.":
-                            st.session_state.ocr_data["komposisi"] = parsed_komposisi
+                            sync_ocr_value_to_form("komposisi", parsed_komposisi)
 
-                        st.success("Komposisi berhasil diproses. Periksa lagi hasilnya di form konfirmasi.")
+                        st.success("Komposisi berhasil diproses dari satu variasi OCR terbaik agar tidak berulang. Periksa lagi sebelum analisis.")
                         render_ocr_result_debug(scan_result_2, "komposisi")
             except Exception as exc:
                 st.error("Gambar komposisi tidak bisa dibaca. Coba upload ulang dalam format JPG atau PNG.")
