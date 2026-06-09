@@ -59,6 +59,31 @@ def fmt(value, digits=2, suffix=""):
         return f"0.{'0' * digits}{suffix}"
 
 
+def run_ocr_safely(reader, image, mode):
+    try:
+        return parse_scan_result(reader, image, mode=mode), None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def render_ocr_result_debug(scan_result, label):
+    if not scan_result:
+        return
+
+    errors = scan_result.get("errors", [])
+    if errors:
+        with st.expander(f"Catatan OCR {label}", expanded=False):
+            for item in errors:
+                st.warning(item)
+
+    with st.expander(f"Lihat teks OCR {label}", expanded=False):
+        st.text(scan_result.get("raw_text") or "Tidak ada teks terbaca")
+
+    with st.expander(f"Lihat variasi preprocessing {label}", expanded=False):
+        for name, img in scan_result.get("variants", {}).items():
+            safe_image(img, caption=name)
+
+
 NUTRITION_KEYS = [
     "energi",
     "lemak_total",
@@ -430,24 +455,31 @@ elif app_mode == "Scan from Image":
         img_file_1 = st.file_uploader("Upload foto nilai gizi", type=["jpg", "jpeg", "png"], key="upload_gizi") if input_type_1 == "Upload File" else st.camera_input("Foto nilai gizi", key="camera_gizi")
 
         if img_file_1 is not None:
-            image_1 = Image.open(img_file_1)
-            safe_image(image_1, caption="Gambar nilai gizi")
+            try:
+                image_1 = Image.open(img_file_1)
+                safe_image(image_1, caption="Gambar nilai gizi")
 
-            with st.spinner("Membaca nilai gizi dengan OCR multi preprocessing..."):
-                scan_result_1 = parse_scan_result(reader, image_1, mode="nutrition")
-                parsed_gizi = scan_result_1["parsed"]
+                if st.button("Proses OCR Nilai Gizi", key="btn_ocr_gizi"):
+                    with st.spinner("Membaca nilai gizi dengan OCR yang lebih aman untuk Streamlit Cloud..."):
+                        scan_result_1, ocr_error_1 = run_ocr_safely(reader, image_1, mode="nutrition")
 
-                for key, value in parsed_gizi.items():
-                    if key in st.session_state.ocr_data:
-                        if value not in [0, 0.0, "Tidak terdeteksi.", "Produk Tanpa Nama", ""]:
-                            st.session_state.ocr_data[key] = value
+                    if ocr_error_1:
+                        st.error("OCR nilai gizi gagal diproses. Aplikasi tidak dihentikan. Silakan input manual atau coba foto yang lebih jelas.")
+                        with st.expander("Detail error OCR nilai gizi"):
+                            st.code(ocr_error_1)
+                    else:
+                        parsed_gizi = scan_result_1["parsed"]
+                        for key, value in parsed_gizi.items():
+                            if key in st.session_state.ocr_data:
+                                if value not in [0, 0.0, "Tidak terdeteksi.", "Produk Tanpa Nama", ""]:
+                                    st.session_state.ocr_data[key] = value
 
-            st.success("Nilai gizi berhasil diproses. Periksa lagi hasilnya di form konfirmasi.")
-            with st.expander("Lihat teks OCR nilai gizi"):
-                st.text(scan_result_1["raw_text"] or "Tidak ada teks terbaca")
-            with st.expander("Lihat variasi preprocessing"):
-                for name, img in scan_result_1["variants"].items():
-                    safe_image(img, caption=name)
+                        st.success("Nilai gizi berhasil diproses. Periksa lagi hasilnya di form konfirmasi.")
+                        render_ocr_result_debug(scan_result_1, "nilai gizi")
+            except Exception as exc:
+                st.error("Gambar nilai gizi tidak bisa dibaca. Coba upload ulang dalam format JPG atau PNG.")
+                with st.expander("Detail error gambar nilai gizi"):
+                    st.code(str(exc))
 
     with col_scan2:
         st.subheader("Scan 2: Komposisi Produk")
@@ -455,21 +487,29 @@ elif app_mode == "Scan from Image":
         img_file_2 = st.file_uploader("Upload foto komposisi", type=["jpg", "jpeg", "png"], key="upload_komposisi") if input_type_2 == "Upload File" else st.camera_input("Foto komposisi", key="camera_komposisi")
 
         if img_file_2 is not None:
-            image_2 = Image.open(img_file_2)
-            safe_image(image_2, caption="Gambar komposisi")
+            try:
+                image_2 = Image.open(img_file_2)
+                safe_image(image_2, caption="Gambar komposisi")
 
-            with st.spinner("Membaca komposisi dengan OCR multi preprocessing..."):
-                scan_result_2 = parse_scan_result(reader, image_2, mode="composition")
-                parsed_komposisi = scan_result_2["parsed"].get("komposisi", "Tidak terdeteksi.")
-                if parsed_komposisi != "Tidak terdeteksi.":
-                    st.session_state.ocr_data["komposisi"] = parsed_komposisi
+                if st.button("Proses OCR Komposisi", key="btn_ocr_komposisi"):
+                    with st.spinner("Membaca komposisi dengan OCR yang lebih aman untuk Streamlit Cloud..."):
+                        scan_result_2, ocr_error_2 = run_ocr_safely(reader, image_2, mode="composition")
 
-            st.success("Komposisi berhasil diproses. Periksa lagi hasilnya di form konfirmasi.")
-            with st.expander("Lihat teks OCR komposisi"):
-                st.text(scan_result_2["raw_text"] or "Tidak ada teks terbaca")
-            with st.expander("Lihat variasi preprocessing"):
-                for name, img in scan_result_2["variants"].items():
-                    safe_image(img, caption=name)
+                    if ocr_error_2:
+                        st.error("OCR komposisi gagal diproses. Aplikasi tidak dihentikan. Silakan input manual atau coba foto yang lebih jelas.")
+                        with st.expander("Detail error OCR komposisi"):
+                            st.code(ocr_error_2)
+                    else:
+                        parsed_komposisi = scan_result_2["parsed"].get("komposisi", "Tidak terdeteksi.")
+                        if parsed_komposisi != "Tidak terdeteksi.":
+                            st.session_state.ocr_data["komposisi"] = parsed_komposisi
+
+                        st.success("Komposisi berhasil diproses. Periksa lagi hasilnya di form konfirmasi.")
+                        render_ocr_result_debug(scan_result_2, "komposisi")
+            except Exception as exc:
+                st.error("Gambar komposisi tidak bisa dibaca. Coba upload ulang dalam format JPG atau PNG.")
+                with st.expander("Detail error gambar komposisi"):
+                    st.code(str(exc))
 
     st.markdown("---")
     st.subheader("Konfirmasi Data Hasil OCR")

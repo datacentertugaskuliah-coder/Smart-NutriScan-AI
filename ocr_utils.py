@@ -1,22 +1,23 @@
 """
 Utility OCR untuk Smart NutriScan AI.
-Fokus file ini adalah membaca label nilai gizi dan komposisi produk dengan lebih stabil.
-Alur utama:
-1. Membuat beberapa variasi gambar.
-2. Menjalankan EasyOCR dengan detail posisi teks.
-3. Mengelompokkan hasil OCR berdasarkan baris.
-4. Mengekstrak nilai gizi dan komposisi dari baris teks.
+
+Revisi v4 fokus pada kestabilan saat gambar diupload ke Streamlit Cloud.
+Perubahan utama:
+1. Gambar dibatasi ukurannya agar OCR tidak membebani memori cloud.
+2. OCR tidak memakai rotasi otomatis yang berat.
+3. EasyOCR membaca numpy array, bukan byte stream, agar lebih kompatibel.
+4. Error OCR ditangkap per variasi gambar agar aplikasi tidak langsung crash.
+5. Hasil parsing tetap berbasis baris agar nilai gizi dan komposisi lebih logis.
 """
 
 from __future__ import annotations
 
-import io
 import re
-from typing import Dict, List, Any
+from typing import Any, Dict, List, Tuple
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 
 NUTRITION_DEFAULTS: Dict[str, Any] = {
@@ -34,19 +35,31 @@ NUTRITION_DEFAULTS: Dict[str, Any] = {
 }
 
 
+def normalize_pil_image(pil_image: Image.Image, max_side: int = 1600) -> Image.Image:
+    """Membuat gambar aman untuk OCR dan Streamlit Cloud."""
+    image = ImageOps.exif_transpose(pil_image).convert("RGB")
+    width, height = image.size
+    longest = max(width, height)
+
+    if longest > max_side:
+        ratio = max_side / float(longest)
+        new_size = (max(1, int(width * ratio)), max(1, int(height * ratio)))
+        image = image.resize(new_size, Image.LANCZOS)
+
+    return image
+
+
 def preprocess_image_variants_for_ocr(pil_image: Image.Image) -> Dict[str, Image.Image]:
-    """Menghasilkan beberapa versi gambar agar OCR tidak bergantung pada satu metode preprocessing."""
-    img = np.array(pil_image.convert("RGB"))
+    """Menghasilkan variasi gambar ringan agar OCR tidak bergantung pada satu metode preprocessing."""
+    safe_image = normalize_pil_image(pil_image)
+    img = np.array(safe_image)
 
-    img_big = cv2.resize(
-        img,
-        None,
-        fx=2.0,
-        fy=2.0,
-        interpolation=cv2.INTER_CUBIC,
-    )
+    # Perbesar secukupnya. Jangan terlalu besar agar tidak boros memori cloud.
+    h, w = img.shape[:2]
+    if max(h, w) < 1200:
+        img = cv2.resize(img, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
 
-    gray = cv2.cvtColor(img_big, cv2.COLOR_RGB2GRAY)
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
@@ -54,18 +67,9 @@ def preprocess_image_variants_for_ocr(pil_image: Image.Image) -> Dict[str, Image
     denoised = cv2.fastNlMeansDenoising(
         enhanced,
         None,
-        h=10,
+        h=8,
         templateWindowSize=7,
         searchWindowSize=21,
-    )
-
-    binary = cv2.adaptiveThreshold(
-        denoised,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        11,
     )
 
     sharpen_kernel = np.array([
@@ -75,11 +79,21 @@ def preprocess_image_variants_for_ocr(pil_image: Image.Image) -> Dict[str, Image
     ])
     sharpened = cv2.filter2D(denoised, -1, sharpen_kernel)
 
+    # Binary kadang bagus, kadang merusak teks kecil. Tetap disiapkan sebagai variasi ringan.
+    binary = cv2.adaptiveThreshold(
+        denoised,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        11,
+    )
+
     return {
-        "original_resized": Image.fromarray(img_big),
+        "original_resized": Image.fromarray(img),
         "gray_enhanced": Image.fromarray(denoised),
-        "binary": Image.fromarray(binary),
         "sharpened": Image.fromarray(sharpened),
+        "binary": Image.fromarray(binary),
     }
 
 
@@ -106,38 +120,72 @@ def deduplicate_ocr_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any
     return list(unique.values())
 
 
-def run_ocr_multi_variant(reader: Any, pil_image: Image.Image, min_confidence: float = 0.20) -> Dict[str, Any]:
-    """Menjalankan EasyOCR pada beberapa variasi gambar dan mengembalikan item teks terstruktur."""
-    variants = preprocess_image_variants_for_ocr(pil_image)
-    all_results: List[Dict[str, Any]] = []
+def _reader_readtext_safely(reader: Any, image_variant: Image.Image) -> Tuple[List[Any], str]:
+    """Menjalankan EasyOCR dengan parameter aman dan fallback jika versi EasyOCR berbeda."""
+    image_array = np.array(image_variant)
 
-    for variant_name, image_variant in variants.items():
-        img_byte_arr = io.BytesIO()
-        image_variant.save(img_byte_arr, format="PNG")
-
+    try:
         results = reader.readtext(
-            img_byte_arr.getvalue(),
+            image_array,
             detail=1,
             paragraph=False,
-            decoder="beamsearch",
-            beamWidth=5,
-            contrast_ths=0.05,
-            adjust_contrast=0.7,
+            decoder="greedy",
+            contrast_ths=0.1,
+            adjust_contrast=0.6,
             text_threshold=0.5,
             low_text=0.3,
             link_threshold=0.4,
-            mag_ratio=2,
-            rotation_info=[90, 180, 270],
+            mag_ratio=1.0,
         )
+        return results, ""
+    except TypeError as exc:
+        # Fallback untuk EasyOCR yang tidak menerima salah satu parameter tambahan.
+        try:
+            results = reader.readtext(image_array, detail=1, paragraph=False)
+            return results, ""
+        except Exception as inner_exc:
+            return [], f"EasyOCR fallback gagal: {inner_exc}"
+    except Exception as exc:
+        return [], f"EasyOCR gagal membaca gambar: {exc}"
 
-        for bbox, text, conf in results:
+
+def run_ocr_multi_variant(
+    reader: Any,
+    pil_image: Image.Image,
+    min_confidence: float = 0.20,
+    max_variants: int = 3,
+) -> Dict[str, Any]:
+    """Menjalankan EasyOCR pada beberapa variasi gambar tanpa membuat aplikasi crash."""
+    variants = preprocess_image_variants_for_ocr(pil_image)
+    selected_variants = dict(list(variants.items())[:max_variants])
+
+    all_results: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    for variant_name, image_variant in selected_variants.items():
+        results, error_message = _reader_readtext_safely(reader, image_variant)
+        if error_message:
+            errors.append(f"{variant_name}: {error_message}")
+            continue
+
+        for result in results:
+            try:
+                bbox, text, conf = result
+            except Exception:
+                continue
+
             clean_text = str(text).strip()
-            if clean_text and float(conf) >= min_confidence:
+            try:
+                confidence = float(conf)
+            except Exception:
+                confidence = 0.0
+
+            if clean_text and confidence >= min_confidence:
                 all_results.append({
                     "variant": variant_name,
                     "bbox": bbox,
                     "text": clean_text,
-                    "conf": float(conf),
+                    "conf": confidence,
                 })
 
     deduped = deduplicate_ocr_results(all_results)
@@ -147,7 +195,8 @@ def run_ocr_multi_variant(reader: Any, pil_image: Image.Image, min_confidence: f
         "items": deduped,
         "lines": lines,
         "raw_text": "\n".join(lines),
-        "variants": variants,
+        "variants": selected_variants,
+        "errors": errors,
     }
 
 
@@ -202,7 +251,6 @@ def normalize_ocr_text(text: str) -> str:
         "lemak tota1": "lemak total",
         "lemak totai": "lemak total",
         "saturated fat": "lemak jenuh",
-        "lemak jenuh": "lemak jenuh",
         "total carbohydrate": "karbohidrat",
         "carbohydrate": "karbohidrat",
         "karbohidrat total": "karbohidrat",
@@ -224,10 +272,10 @@ def normalize_ocr_text(text: str) -> str:
     return text
 
 
-def _extract_numbers_with_units(line: str) -> List[tuple[float, str]]:
+def _extract_numbers_with_units(line: str) -> List[Tuple[float, str]]:
     clean_line = normalize_ocr_text(line)
     matches = re.findall(r"(\d+(?:\.\d+)?)\s*(kkal|kal|mg|g)?", clean_line)
-    values: List[tuple[float, str]] = []
+    values: List[Tuple[float, str]] = []
 
     for number, unit in matches:
         try:
@@ -238,7 +286,7 @@ def _extract_numbers_with_units(line: str) -> List[tuple[float, str]]:
     return values
 
 
-def extract_number_from_line(line: str, preferred_units: tuple[str, ...] | None = None) -> float:
+def extract_number_from_line(line: str, preferred_units: Tuple[str, ...] | None = None) -> float:
     """Mengambil angka paling logis dari satu baris label."""
     values = _extract_numbers_with_units(line)
     if not values:
@@ -258,7 +306,6 @@ def parse_nutrition_from_lines(lines: List[str]) -> Dict[str, Any]:
 
     for line in lines:
         clean_line = normalize_ocr_text(line)
-
         if not clean_line:
             continue
 
@@ -326,12 +373,8 @@ def parse_composition_from_lines(lines: List[str]) -> str:
         return "Tidak terdeteksi."
 
     normalized = normalize_ocr_text(raw_text)
-
-    match = re.search(r"(?:komposisi|bahan)\s*:?[\s]*(.*)", normalized, flags=re.IGNORECASE)
-    if match:
-        composition = match.group(1)
-    else:
-        composition = normalized
+    match = re.search(r"(?:komposisi|bahan)\s*:?\s*(.*)", normalized, flags=re.IGNORECASE)
+    composition = match.group(1) if match else normalized
 
     stop_patterns = [
         "informasi nilai gizi",
@@ -349,7 +392,6 @@ def parse_composition_from_lines(lines: List[str]) -> str:
         composition = re.split(stop_word, composition, flags=re.IGNORECASE)[0]
 
     composition = re.sub(r"\s+", " ", composition).strip(" .,:;")
-
     if len(composition) < 5:
         return "Tidak terdeteksi."
 
@@ -373,4 +415,5 @@ def parse_scan_result(reader: Any, pil_image: Image.Image, mode: str = "nutritio
         "raw_text": ocr_payload["raw_text"],
         "items": ocr_payload["items"],
         "variants": ocr_payload["variants"],
+        "errors": ocr_payload.get("errors", []),
     }
