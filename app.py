@@ -120,6 +120,10 @@ def bump_ocr_form_version():
     st.session_state.ocr_form_version += 1
 
 
+def clear_ocr_analysis_result():
+    st.session_state.ocr_analysis_result = None
+
+
 def render_ocr_result_debug(scan_result, label):
     if not scan_result:
         return
@@ -228,6 +232,12 @@ if "ocr_data" not in st.session_state:
 
 if "ocr_form_version" not in st.session_state:
     st.session_state.ocr_form_version = 0
+
+if "ocr_analysis_result" not in st.session_state:
+    st.session_state.ocr_analysis_result = None
+
+if "manual_analysis_result" not in st.session_state:
+    st.session_state.manual_analysis_result = None
 
 
 def hitung_tdee_dinamis(gender, usia, berat, tinggi, aktivitas):
@@ -364,11 +374,29 @@ def render_health_metrics(nutrition_data, takaran_saji, current_threshold):
     st.progress(min(int(round(lemak_jenuh_pct)), 100))
 
 
-def run_product_analysis(product_name, takaran_saji, nutrition_data, komposisi, current_threshold):
+def make_analysis_signature(product_name, takaran_saji, nutrition_data, komposisi):
+    return {
+        "product_name": str(product_name or "").strip(),
+        "takaran_saji": round(float(takaran_saji or 0), 4),
+        "nutrition": {
+            key: round(float(nutrition_data.get(key, 0) or 0), 4)
+            for key in sorted(nutrition_data.keys())
+        },
+        "komposisi": str(komposisi or "").strip(),
+    }
+
+
+def build_analysis_result(product_name, takaran_saji, nutrition_data, komposisi):
     if not has_sufficient_input(nutrition_data):
-        st.warning("Data belum cukup untuk dianalisis. Isi atau koreksi minimal satu nilai gizi yang valid sebelum menjalankan rekomendasi.")
-        st.info("Sistem tidak akan memberi label tinggi, sedang, atau aman ketika data masih kosong. Ini menjaga integritas hasil analisis.")
-        return
+        return {
+            "status": "insufficient",
+            "message": "Data belum cukup untuk dianalisis. Isi atau koreksi minimal satu nilai gizi yang valid sebelum menjalankan rekomendasi.",
+            "integrity_note": "Sistem tidak memberi label tinggi, sedang, atau aman ketika data masih kosong. Ini menjaga integritas hasil analisis.",
+            "product_name": product_name or "Produk Tanpa Nama",
+            "takaran_saji": float(takaran_saji or 0),
+            "nutrition_data": nutrition_data,
+            "komposisi": komposisi,
+        }
 
     risk_score, xai_factors, recommendation = analyze_product_fully(
         nutrition_data,
@@ -378,15 +406,44 @@ def run_product_analysis(product_name, takaran_saji, nutrition_data, komposisi, 
         w2v_model,
         scaler,
     )
-
     risk_info = classify_risk(risk_score)
-    st.session_state.scan_history.append({
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    is_upf, flags = detect_harmful_additives(komposisi)
+
+    return {
+        "status": "ok",
         "product_name": product_name or "Produk Tanpa Nama",
-        "risk_score": round(risk_score, 2),
-        "classification": risk_info["label"],
-        "nutrition": nutrition_data,
-    })
+        "takaran_saji": float(takaran_saji or 0),
+        "nutrition_data": nutrition_data,
+        "komposisi": komposisi,
+        "risk_score": float(risk_score),
+        "risk_info": risk_info,
+        "xai_factors": xai_factors,
+        "recommendation": recommendation,
+        "is_upf": is_upf,
+        "upf_flags": flags,
+    }
+
+
+def render_analysis_result(analysis_result, current_threshold, current_signature=None):
+    if not analysis_result:
+        st.info("Hasil analisis akan muncul di sini setelah tombol analisis diklik.")
+        return
+
+    stored_signature = analysis_result.get("input_signature")
+    if stored_signature is not None and current_signature is not None and stored_signature != current_signature:
+        st.warning("Data input sudah berubah setelah analisis terakhir. Klik Analisis dari Data Hasil OCR untuk memperbarui hasil.")
+
+    if analysis_result.get("status") == "insufficient":
+        st.warning(analysis_result.get("message", "Data belum cukup untuk dianalisis."))
+        st.info(analysis_result.get("integrity_note", "Periksa kembali data input sebelum analisis."))
+        return
+
+    risk_score = float(analysis_result.get("risk_score", 0))
+    xai_factors = analysis_result.get("xai_factors", {})
+    recommendation = analysis_result.get("recommendation", "")
+    nutrition_data = analysis_result.get("nutrition_data", {})
+    takaran_saji = analysis_result.get("takaran_saji", 0)
+    komposisi = analysis_result.get("komposisi", "")
 
     render_risk_status(risk_score)
     st.markdown("#### Radar Kontribusi Nutrisi")
@@ -394,14 +451,34 @@ def run_product_analysis(product_name, takaran_saji, nutrition_data, komposisi, 
     st.markdown("#### Rekomendasi")
     st.info(recommendation)
 
-    is_upf, flags = detect_harmful_additives(komposisi)
-    if is_upf:
+    if analysis_result.get("is_upf"):
         st.error("Indikasi bahan ultra proses terdeteksi")
-        st.write(", ".join(flags))
+        st.write(", ".join(analysis_result.get("upf_flags", [])))
 
     st.markdown("---")
     render_health_metrics(nutrition_data, takaran_saji, current_threshold)
 
+
+def run_product_analysis(product_name, takaran_saji, nutrition_data, komposisi, current_threshold, store_key=None, input_signature=None):
+    analysis_result = build_analysis_result(product_name, takaran_saji, nutrition_data, komposisi)
+    analysis_result["input_signature"] = input_signature or make_analysis_signature(product_name, takaran_saji, nutrition_data, komposisi)
+
+    if store_key:
+        st.session_state[store_key] = analysis_result
+
+    if analysis_result.get("status") == "ok":
+        risk_score = analysis_result["risk_score"]
+        risk_info = analysis_result["risk_info"]
+        st.session_state.scan_history.append({
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "product_name": analysis_result["product_name"],
+            "risk_score": round(risk_score, 2),
+            "classification": risk_info["label"],
+            "nutrition": nutrition_data,
+        })
+
+    render_analysis_result(analysis_result, current_threshold, current_signature=analysis_result["input_signature"])
+    return analysis_result
 
 def input_form(prefix, defaults):
     """Form input yang aman terhadap Session State Streamlit.
@@ -537,8 +614,20 @@ if app_mode == "Analisis Produk Tunggal":
 
     product_name, takaran_saji, nutrition_data, komposisi = input_form("manual", defaults)
 
+    manual_signature = make_analysis_signature(product_name, takaran_saji, nutrition_data, komposisi)
     if st.button("Analisis AI dan Gizi", type="primary"):
-        run_product_analysis(product_name, takaran_saji, nutrition_data, komposisi, current_threshold)
+        run_product_analysis(
+            product_name,
+            takaran_saji,
+            nutrition_data,
+            komposisi,
+            current_threshold,
+            store_key="manual_analysis_result",
+            input_signature=manual_signature,
+        )
+    elif st.session_state.manual_analysis_result:
+        st.markdown("### Hasil Analisis Terakhir")
+        render_analysis_result(st.session_state.manual_analysis_result, current_threshold, current_signature=manual_signature)
 
 
 elif app_mode == "Scan from Image":
@@ -547,8 +636,9 @@ elif app_mode == "Scan from Image":
 
     if st.button("Reset Hasil OCR"):
         st.session_state.ocr_data = init_parsed_data()
+        clear_ocr_analysis_result()
         bump_ocr_form_version()
-        st.success("Hasil OCR sudah dikosongkan.")
+        st.success("Hasil OCR dan analisis terakhir sudah dikosongkan.")
 
     col_scan1, col_scan2 = st.columns(2)
 
@@ -583,6 +673,7 @@ elif app_mode == "Scan from Image":
                                     sync_ocr_value_to_form(key, value)
                                     changed = True
                         if changed:
+                            clear_ocr_analysis_result()
                             bump_ocr_form_version()
 
                         st.success("Nilai gizi berhasil diproses. Angka satuan g yang terbaca sebagai 9 sudah dikoreksi sebelum masuk form. Periksa lagi sebelum analisis.")
@@ -618,6 +709,7 @@ elif app_mode == "Scan from Image":
                         parsed_komposisi = scan_result_2["parsed"].get("komposisi", "Tidak terdeteksi.")
                         if parsed_komposisi != "Tidak terdeteksi.":
                             sync_ocr_value_to_form("komposisi", parsed_komposisi)
+                            clear_ocr_analysis_result()
                             bump_ocr_form_version()
 
                         st.success("Komposisi berhasil diproses dari satu variasi OCR terbaik agar tidak berulang. Periksa lagi sebelum analisis.")
@@ -628,14 +720,30 @@ elif app_mode == "Scan from Image":
                     st.code(str(exc))
 
     st.markdown("---")
-    st.subheader("Konfirmasi Data Hasil OCR")
-    st.warning("Jangan langsung percaya OCR mentah. Koreksi angka dan komposisi sebelum menjalankan rekomendasi.")
+    input_col, result_col = st.columns([1.15, 1], gap="large")
 
-    ocr_prefix = f"ocr_{st.session_state.ocr_form_version}"
-    product_name, takaran_saji, nutrition_data, komposisi = input_form(ocr_prefix, st.session_state.ocr_data)
+    with input_col:
+        st.subheader("Konfirmasi Data Input (Hasil OCR)")
+        st.warning("Jangan langsung percaya OCR mentah. Koreksi angka dan komposisi sebelum menjalankan rekomendasi.")
 
-    if st.button("Analisis dari Data Hasil OCR", type="primary"):
-        run_product_analysis(product_name, takaran_saji, nutrition_data, komposisi, current_threshold)
+        ocr_prefix = f"ocr_{st.session_state.ocr_form_version}"
+        product_name, takaran_saji, nutrition_data, komposisi = input_form(ocr_prefix, st.session_state.ocr_data)
+        ocr_signature = make_analysis_signature(product_name, takaran_saji, nutrition_data, komposisi)
+
+        if st.button("Analisis dari Data Hasil OCR", type="primary"):
+            run_product_analysis(
+                product_name,
+                takaran_saji,
+                nutrition_data,
+                komposisi,
+                current_threshold,
+                store_key="ocr_analysis_result",
+                input_signature=ocr_signature,
+            )
+
+    with result_col:
+        st.subheader("Hasil Analisis AI (Prediksi Risiko)")
+        render_analysis_result(st.session_state.ocr_analysis_result, current_threshold, current_signature=ocr_signature)
 
 
 elif app_mode == "Analisis Batch Excel":
