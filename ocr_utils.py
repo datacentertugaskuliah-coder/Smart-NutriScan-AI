@@ -1,7 +1,7 @@
 """
 Utility OCR untuk Smart NutriScan AI.
 
-Revisi v7 fokus pada akurasi logis hasil OCR dan koreksi salah baca satuan gram.
+Revisi v8 fokus pada akurasi logis hasil OCR dan koreksi sisa kasus gula 1 g yang terbaca 19.
 Masalah yang diperbaiki:
 1. Hasil dari beberapa variasi preprocessing tidak lagi digabung mentah karena bisa menduplikasi teks.
 2. Parsing nilai gizi memakai kandidat per variasi gambar, lalu memilih nilai yang paling masuk akal.
@@ -10,6 +10,7 @@ Masalah yang diperbaiki:
 5. Takaran saji ikut dibaca dari label.
 6. Komposisi dibaca dari satu variasi terbaik agar tidak berulang dua sampai tiga kali.
 7. Huruf g yang sering terbaca sebagai angka 9 diperbaiki sebelum angka masuk ke form.
+8. Gula divalidasi terhadap karbohidrat total agar 1g yang terbaca 19 tidak masuk sebagai 19 g.
 """
 
 from __future__ import annotations
@@ -533,6 +534,14 @@ def _repair_value_by_field(field: str, value: float, line: str) -> Optional[floa
         elif value > 100:
             value = value / 10.0
 
+        # Kasus nyata label: "1 g" sering terbaca menjadi "19" karena huruf g dianggap angka 9.
+        # Koreksi ini hanya berlaku bila tidak ada satuan g eksplisit pada baris OCR.
+        # Jika tertulis jelas "19 g", nilai tetap dipertahankan karena bisa saja benar.
+        has_explicit_gram = bool(re.search(r"\b19\s*g\b", clean))
+        has_percent_context = bool(re.search(r"\b\d+\s*%", clean))
+        if abs(value - 19.0) < 1e-9 and not has_explicit_gram and has_percent_context:
+            value = 1.0
+
     elif field == "protein":
         if value > 100:
             value = value / 100.0
@@ -700,6 +709,23 @@ def parse_nutrition_from_variants(variant_payloads: List[Dict[str, Any]]) -> Tup
             data[field] = chosen
         elif field != "natrium_benzoat":
             warnings.append(f"{field}: tidak terbaca dengan cukup yakin")
+
+    # Validasi logis: gula adalah bagian dari karbohidrat.
+    # Jika gula terbaca lebih besar dari karbohidrat dan angkanya berakhir 9,
+    # besar kemungkinan satuan g masih terbaca sebagai angka 9.
+    # Contoh: 1g terbaca 19, sementara karbohidrat total 14g.
+    try:
+        gula_value = float(data.get("gula", 0) or 0)
+        karbo_value = float(data.get("karbohidrat", 0) or 0)
+        if karbo_value > 0 and gula_value > karbo_value:
+            gula_token = str(int(round(gula_value))) if abs(gula_value - round(gula_value)) < 1e-9 else ""
+            if gula_token.endswith("9") and len(gula_token) >= 2:
+                repaired_gula = float(gula_token[:-1])
+                if 0 <= repaired_gula <= karbo_value:
+                    data["gula"] = round(repaired_gula, 2)
+                    warnings.append("gula: dikoreksi karena satuan g kemungkinan terbaca sebagai angka 9")
+    except Exception:
+        pass
 
     # Jika label memakai Garam sebagai gram dan natrium kosong, konversi konservatif ke natrium.
     if data.get("garam", 0) > 0 and data.get("natrium", 0) == 0:
